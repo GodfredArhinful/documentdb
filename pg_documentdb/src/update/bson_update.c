@@ -1,5 +1,7 @@
 /*-------------------------------------------------------------------------
- * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
  *
  * src/bson/bson_update.c
  *
@@ -28,6 +30,8 @@
 #include "utils/version_utils.h"
 #include "aggregation/bson_query.h"
 #include "commands/commands_common.h"
+#include "collation/collation.h"
+#include "commands/insert.h"
 
 #include "api_hooks.h"
 #include "api_hooks_def.h"
@@ -50,6 +54,9 @@ typedef struct BsonUpdateMetadata
 
 	/* The source document used in handling upserts */
 	pgbson *sourceDocOnUpsert;
+
+	/* The collation to use when applying the update */
+	const char *collationString;
 
 	/* Cached state based on the update type */
 	union
@@ -86,6 +93,7 @@ static void BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata,
 									const bson_value_t *querySpec, const
 									bson_value_t *arrayFilters,
 									const bson_value_t *variableSpec,
+									const char *collationString,
 									bool buildSourceDocOnUpsert);
 
 static pgbson * BsonUpdateDocumentCore(pgbson *sourceDocument, const
@@ -200,6 +208,12 @@ bson_update_document(PG_FUNCTION_ARGS)
 		variableSpec = ConvertPgbsonToBsonValue(variableSpecDoc);
 	}
 
+	const char *collationString = NULL;
+	if (EnableCollation && PG_NARGS() > 5 && !PG_ARGISNULL(5))
+	{
+		collationString = text_to_cstring(PG_GETARG_TEXT_PP(5));
+	}
+
 	pgbsonelement updateSpecElement;
 	PgbsonToSinglePgbsonElement(updateSpecDoc, &updateSpecElement);
 	bson_value_t querySpec = ConvertPgbsonToBsonValue(querySpecDoc);
@@ -229,24 +243,26 @@ bson_update_document(PG_FUNCTION_ARGS)
 	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
 
 	/* Build any cacheable state for processing updates */
-	int stateArgPositions[4] = { 1, 2, 3, 4 };
+	int stateArgPositions[5] = { 1, 2, 3, 4, 5 };
+	int numberStateArgs = Min(PG_NARGS() - 1, 5);
 	BsonUpdateMetadata *metadata;
 
 	SetCachedFunctionStateMultiArgs(
 		metadata,
 		BsonUpdateMetadata,
 		&stateArgPositions[0],
-		3,
+		numberStateArgs,
 		BuildBsonUpdateMetadata,
 		&updateSpecElement.bsonValue, &querySpec, arrayFilters,
-		&variableSpec, buildSourceDocOnUpsert);
+		&variableSpec, collationString, buildSourceDocOnUpsert);
 
 	pgbson *document;
 	if (metadata == NULL)
 	{
 		BsonUpdateMetadata localMetadata = { 0 };
 		BuildBsonUpdateMetadata(&localMetadata, &updateSpecElement.bsonValue, &querySpec,
-								arrayFilters, &variableSpec, buildSourceDocOnUpsert);
+								arrayFilters, &variableSpec, collationString,
+								buildSourceDocOnUpsert);
 		document = BsonUpdateDocumentCore(sourceDocument, &updateSpecElement.bsonValue,
 										  &localMetadata, &updateSource, NULL);
 	}
@@ -259,9 +275,12 @@ bson_update_document(PG_FUNCTION_ARGS)
 
 	if (document != NULL)
 	{
+		Datum documentDatum = PointerGetDatum(document);
+		documentDatum = CompressBsonIfNeeded(documentDatum);
+
 		NumBsonDocumentsUpdated++;
 		LastBsonUpdateReturnedNewValue = true;
-		PG_RETURN_POINTER(document);
+		PG_RETURN_DATUM(documentDatum);
 	}
 	else
 	{
@@ -352,8 +371,10 @@ bson_update_document_with_update_desc(PG_FUNCTION_ARGS)
 	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
 
 	BsonUpdateMetadata metadata = { 0 };
+	const char *collationString = NULL;
 	BuildBsonUpdateMetadata(&metadata, &updateSpecElement.bsonValue, &querySpec,
-							arrayFilters, &variableSpec, buildSourceDocOnUpsert);
+							arrayFilters, &variableSpec, collationString,
+							buildSourceDocOnUpsert);
 
 	pgbson *updateDescription = NULL;
 	pgbson *document = BsonUpdateDocumentCore(sourceDocument,
@@ -395,12 +416,13 @@ bson_update_document_with_update_desc(PG_FUNCTION_ARGS)
  */
 void
 ValidateUpdateDocument(const bson_value_t *updateSpec, const bson_value_t *querySpec,
-					   const bson_value_t *arrayFilters, const bson_value_t *variableSpec)
+					   const bson_value_t *arrayFilters, const bson_value_t *variableSpec,
+					   const char *collationString)
 {
 	BsonUpdateMetadata metadata = { 0 };
 	bool buildSourceDocOnUpsert = false;
 	BuildBsonUpdateMetadata(&metadata, updateSpec, querySpec, arrayFilters,
-							variableSpec, buildSourceDocOnUpsert);
+							variableSpec, collationString, buildSourceDocOnUpsert);
 }
 
 
@@ -411,7 +433,7 @@ ValidateUpdateDocument(const bson_value_t *updateSpec, const bson_value_t *query
 pgbson *
 BsonUpdateDocument(pgbson *sourceDocument, const bson_value_t *updateSpec,
 				   const bson_value_t *querySpec, const bson_value_t *arrayFilters,
-				   const bson_value_t *variableSpec)
+				   const bson_value_t *variableSpec, const char *collationString)
 {
 	BsonUpdateMetadata metadata = { 0 };
 	BsonUpdateSource updateSource = { 0 };
@@ -420,7 +442,7 @@ BsonUpdateDocument(pgbson *sourceDocument, const bson_value_t *updateSpec,
 	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
 
 	BuildBsonUpdateMetadata(&metadata, updateSpec, querySpec, arrayFilters,
-							variableSpec, buildSourceDocOnUpsert);
+							variableSpec, collationString, buildSourceDocOnUpsert);
 	return BsonUpdateDocumentCore(sourceDocument, updateSpec, &metadata, &updateSource,
 								  NULL);
 }
@@ -434,7 +456,7 @@ pgbson *
 BsonUpdateDocumentWithSource(pgbson *sourceDocument, const bson_value_t *updateSpec,
 							 const bson_value_t *querySpec, const
 							 bson_value_t *arrayFilters, const bson_value_t *variableSpec,
-							 ItemPointer ctid, Oid tableOid)
+							 const char *collationString, ItemPointer ctid, Oid tableOid)
 {
 	BsonUpdateMetadata metadata = { 0 };
 	BsonUpdateSource updateSource = {
@@ -446,7 +468,7 @@ BsonUpdateDocumentWithSource(pgbson *sourceDocument, const bson_value_t *updateS
 	bool buildSourceDocOnUpsert = IsPgbsonEmptyDocument(sourceDocument);
 
 	BuildBsonUpdateMetadata(&metadata, updateSpec, querySpec, arrayFilters,
-							variableSpec, buildSourceDocOnUpsert);
+							variableSpec, collationString, buildSourceDocOnUpsert);
 	return BsonUpdateDocumentCore(sourceDocument, updateSpec, &metadata, &updateSource,
 								  NULL);
 }
@@ -502,6 +524,7 @@ BsonUpdateDocumentCore(pgbson *sourceDocument, const bson_value_t *updateSpec,
 		{
 			document = ProcessUpdateOperatorWithState(sourceDocument,
 													  updateMetadata->operatorState,
+													  updateMetadata->collationString,
 													  isUpsert,
 													  updateTracker);
 
@@ -594,9 +617,12 @@ BsonUpdateDocumentCore(pgbson *sourceDocument, const bson_value_t *updateSpec,
 static void
 BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata, const bson_value_t *updateSpec,
 						const bson_value_t *querySpec, const bson_value_t *arrayFilters,
-						const bson_value_t *variableSpec, bool buildSourceDocOnUpsert)
+						const bson_value_t *variableSpec, const char *collationString,
+						bool buildSourceDocOnUpsert)
 {
 	metadata->updateType = DetermineUpdateType(updateSpec);
+	metadata->collationString = IsCollationApplicable(collationString) ?
+								pstrdup(collationString) : NULL;
 
 	/* BuildBsonDocumentFromQuery only gets called for upsert */
 	if (buildSourceDocOnUpsert)
@@ -624,6 +650,8 @@ BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata, const bson_value_t *update
 			bool isReplaceStagePresent = false;
 			metadata->aggregationState = GetAggregationPipelineUpdateState(updateSpec,
 																		   variableSpec,
+																		   metadata->
+																		   collationString,
 																		   &
 																		   isReplaceStagePresent);
 
@@ -641,6 +669,7 @@ BuildBsonUpdateMetadata(BsonUpdateMetadata *metadata, const bson_value_t *update
 		{
 			metadata->operatorState = GetOperatorUpdateState(updateSpec, querySpec,
 															 arrayFilters,
+															 metadata->collationString,
 															 buildSourceDocOnUpsert);
 			metadata->commandUpdateType = CommandUpdateType_Update;
 			break;

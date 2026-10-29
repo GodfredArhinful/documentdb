@@ -612,6 +612,30 @@ typedef struct DocumentDBApiOidCacheData
 	/* OID of the bson_dollar_eq(<bson>, <bsonindexbounds>) */
 	Oid BsonIndedBoundsEqualOperatorFuncId;
 
+	/* OID of the <bson> ##> <bsonindexbounds> operator */
+	Oid BsonIndexBoundsGreaterThanOperatorId;
+
+	/* OID of the bson_dollar_gt(<bson>, <bsonindexbounds>) */
+	Oid BsonIndedBoundsGreaterThanOperatorFuncId;
+
+	/* OID of the <bson> ##>= <bsonindexbounds> operator */
+	Oid BsonIndexBoundsGreaterThanEqualOperatorId;
+
+	/* OID of the bson_dollar_gte(<bson>, <bsonindexbounds>) */
+	Oid BsonIndedBoundsGreaterThanEqualOperatorFuncId;
+
+	/* OID of the <bson> ##< <bsonindexbounds> operator */
+	Oid BsonIndexBoundsLessThanOperatorId;
+
+	/* OID of the bson_dollar_lt(<bson>, <bsonindexbounds>) */
+	Oid BsonIndedBoundsLessThanOperatorFuncId;
+
+	/* OID of the <bson> ##<= <bsonindexbounds> operator */
+	Oid BsonIndexBoundsLessThanEqualOperatorId;
+
+	/* OID of the bson_dollar_lte(<bson>, <bsonindexbounds>) */
+	Oid BsonIndedBoundsLessThanEqualOperatorFuncId;
+
 	/* OID of the $gt function function for bson_values */
 	Oid BsonValueGreaterMatchFunctionId;
 
@@ -1315,6 +1339,14 @@ typedef struct DocumentDBApiOidCacheData
 	/* OID of the ApiInternalSchemaName.command_node_worker function */
 	Oid CommandNodeWorkerFunctionOid;
 
+	/* OID of the ApiSchemaName.create_collection function */
+	Oid ApiCreateCollectionFunctionId;
+
+	Oid ApiCreateCollectionWithOptionsFunctionId;
+
+	/* OID of the ApiInternalSchemaName.create_indexes_dispatch function */
+	Oid ApiCreateIndexesDispatchFunctionId;
+
 	/* OID of ApiInternalSchemaName.{ExtensionObjectPrefix}_core_bson_to_bson*/
 	Oid DocumentDBCoreBsonToBsonFunctionOId;
 
@@ -1361,6 +1393,9 @@ typedef struct DocumentDBApiOidCacheData
 
 		/* OID of the CollectionRbacReadWriteAnyDatabaseRole */
 		Oid CollectionRbacReadWriteAnyDatabaseRoleOid;
+
+		/* OID of the CreateIndexesRole */
+		Oid CreateIndexesRoleOid;
 	} RoleOids;
 } DocumentDBApiOidCacheData;
 
@@ -2677,6 +2712,80 @@ BsonIndexBoundsEqualOperatorFuncId(void)
 }
 
 
+Oid
+BsonIndexBoundsGreaterThanOperatorId(void)
+{
+	return GetInternalBinaryOperatorId(
+		&Cache.BsonIndexBoundsGreaterThanOperatorId,
+		BsonTypeId(), "##>", BsonIndexBoundsTypeId());
+}
+
+
+Oid
+BsonIndexBoundsGreaterThanOperatorFuncId(void)
+{
+	return GetBinaryOperatorFunctionIdWithSchema(
+		&Cache.BsonIndedBoundsGreaterThanOperatorFuncId,
+		"bson_dollar_gt", BsonTypeId(), BsonIndexBoundsTypeId(), ApiInternalSchemaNameV2);
+}
+
+
+Oid
+BsonIndexBoundsGreaterThanEqualOperatorId(void)
+{
+	return GetInternalBinaryOperatorId(
+		&Cache.BsonIndexBoundsGreaterThanEqualOperatorId,
+		BsonTypeId(), "##>=", BsonIndexBoundsTypeId());
+}
+
+
+Oid
+BsonIndexBoundsGreaterThanEqualOperatorFuncId(void)
+{
+	return GetBinaryOperatorFunctionIdWithSchema(
+		&Cache.BsonIndedBoundsGreaterThanEqualOperatorFuncId,
+		"bson_dollar_gte", BsonTypeId(), BsonIndexBoundsTypeId(),
+		ApiInternalSchemaNameV2);
+}
+
+
+Oid
+BsonIndexBoundsLessThanOperatorId(void)
+{
+	return GetInternalBinaryOperatorId(
+		&Cache.BsonIndexBoundsLessThanOperatorId,
+		BsonTypeId(), "##<", BsonIndexBoundsTypeId());
+}
+
+
+Oid
+BsonIndexBoundsLessThanOperatorFuncId(void)
+{
+	return GetBinaryOperatorFunctionIdWithSchema(
+		&Cache.BsonIndedBoundsLessThanOperatorFuncId,
+		"bson_dollar_lt", BsonTypeId(), BsonIndexBoundsTypeId(), ApiInternalSchemaNameV2);
+}
+
+
+Oid
+BsonIndexBoundsLessThanEqualOperatorId(void)
+{
+	return GetInternalBinaryOperatorId(
+		&Cache.BsonIndexBoundsLessThanEqualOperatorId,
+		BsonTypeId(), "##<=", BsonIndexBoundsTypeId());
+}
+
+
+Oid
+BsonIndexBoundsLessThanEqualOperatorFuncId(void)
+{
+	return GetBinaryOperatorFunctionIdWithSchema(
+		&Cache.BsonIndedBoundsLessThanEqualOperatorFuncId,
+		"bson_dollar_lte", BsonTypeId(), BsonIndexBoundsTypeId(),
+		ApiInternalSchemaNameV2);
+}
+
+
 /*
  * Returns the OID of the <bson_value_t> $gt <bson> function.
  */
@@ -3518,6 +3627,60 @@ CommandNodeWorkerFunctionOid(void)
 	}
 
 	return Cache.CommandNodeWorkerFunctionOid;
+}
+
+
+/*
+ * Returns the OID of ApiSchemaName.create_collection(text, text), which is the
+ * function a namespace creation ultimately runs.
+ */
+Oid
+ApiCreateCollectionFunctionId(void)
+{
+	int nargs = 2;
+	Oid argTypes[2] = { TEXTOID, TEXTOID };
+	bool missingOk = false;
+
+	return GetSchemaFunctionIdWithNargs(&Cache.ApiCreateCollectionFunctionId,
+										ApiSchemaName, "create_collection", nargs,
+										argTypes, missingOk);
+}
+
+
+Oid
+ApiCreateCollectionWithOptionsFunctionId(void)
+{
+	int nargs = 3;
+	Oid argTypes[3] = { TEXTOID, TEXTOID, BsonTypeId() };
+
+	/* Legacy dispatch must also work before this function is installed. */
+	bool missingOk = true;
+
+	return GetSchemaFunctionIdWithNargs(&Cache.ApiCreateCollectionWithOptionsFunctionId,
+										ApiSchemaName, "create_collection_with_options",
+										nargs, argTypes, missingOk);
+}
+
+
+/*
+ * Returns the OID of the ordinary create-index dispatch function.
+ */
+Oid
+ApiCreateIndexesDispatchFunctionId(void)
+{
+	int nargs = 4;
+	Oid argTypes[4] = {
+		TEXTOID,
+		TEXTOID,
+		BsonTypeId(),
+		BsonTypeId()
+	};
+	bool missingOk = true;
+
+	return GetSchemaFunctionIdWithNargs(&Cache.ApiCreateIndexesDispatchFunctionId,
+										ApiInternalSchemaName,
+										"create_indexes_dispatch", nargs,
+										argTypes, missingOk);
 }
 
 
@@ -8047,6 +8210,23 @@ CollectionRbacReadWriteAnyDatabaseRoleOid(void)
 	}
 
 	return Cache.RoleOids.CollectionRbacReadWriteAnyDatabaseRoleOid;
+}
+
+
+Oid
+CreateIndexesRoleOid(void)
+{
+	InitializeDocumentDBApiExtensionCache();
+
+	if (!OidIsValid(Cache.RoleOids.CreateIndexesRoleOid))
+	{
+		bool missingOk = true;
+
+		Cache.RoleOids.CreateIndexesRoleOid =
+			get_role_oid(API_RBAC_API_INDEX_CREATE_ROLE, missingOk);
+	}
+
+	return Cache.RoleOids.CreateIndexesRoleOid;
 }
 
 

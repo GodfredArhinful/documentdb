@@ -127,6 +127,11 @@ typedef struct
 	 */
 	CursorTopology cursorTopology;
 
+	/* Whether or not the dynamic cursor requires to fetch all rows first
+	 * (false negatives are fine)
+	 */
+	bool requiresDynamicFetchAllCursor;
+
 	/*
 	 * The requested batchSize in the query request.
 	 */
@@ -141,6 +146,13 @@ typedef struct
 	 * The time system variables ($$NOW, $$CLUSTER_TIME).
 	 */
 	TimeSystemVariables timeSystemVariables;
+
+	/*
+	 * Whether collationString contains the effective query collation captured
+	 * for cursor continuation. An empty captured value means binary semantics.
+	 */
+	bool hasCapturedCollation;
+	char collationString[MAX_ICU_COLLATION_LENGTH];
 
 	/*
 	 * Whether this query is being built from the planner aggregation

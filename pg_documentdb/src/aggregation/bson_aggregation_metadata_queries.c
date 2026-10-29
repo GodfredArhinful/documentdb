@@ -54,6 +54,8 @@
 #include "index_am/index_am_extend_create.h"
 #include "rbac_hooks.h"
 
+extern bool EnableBsonTypeArgumentValidation;
+
 static Query * GenerateBaseListCollectionsQuery(Datum databaseDatum, bool nameOnly,
 												bool addDistributedMetadata,
 												AggregationPipelineBuildContext *context);
@@ -252,7 +254,21 @@ GenerateListIndexesQuery(text *databaseDatum, pgbson *listIndexesSpec,
 		if (StringViewEqualsCString(&keyView, "listIndexes") ||
 			StringViewEqualsCString(&keyView, "listindexes"))
 		{
-			EnsureTopLevelFieldType("listIndexes", &listIndexesIter, BSON_TYPE_UTF8);
+			if (!BSON_ITER_HOLDS_UTF8(&listIndexesIter))
+			{
+				if (EnableBsonTypeArgumentValidation)
+				{
+					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDNAMESPACE),
+									errmsg(
+										"Collection name contains an invalid data type %s",
+										BsonIterTypeName(&listIndexesIter))));
+				}
+				else
+				{
+					EnsureTopLevelFieldType("listIndexes", &listIndexesIter,
+											BSON_TYPE_UTF8);
+				}
+			}
 			collectionName.string = bson_iter_utf8(&listIndexesIter,
 												   &collectionName.length);
 			ValidateNamespaceStringForEmbeddedNull(collectionName.string,

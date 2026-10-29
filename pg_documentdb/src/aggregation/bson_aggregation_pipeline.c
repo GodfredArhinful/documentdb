@@ -1,6 +1,8 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
  *
+ * SPDX-License-Identifier: MIT
+ *
  * src/aggregation/bson_aggregation_pipeline.c
  *
  * Implementation of the backend query generation for pipelines.
@@ -88,9 +90,7 @@ extern bool SkipFailOnCollation;
 extern bool DefaultInlineWriteOperations;
 extern int MaxAggregationStagesAllowed;
 
-extern bool FailOnNonEmptyGroupCountArg;
 extern bool ForceGroupSubqueryElimination;
-extern bool EnableTailableCursorMaxAwaitTime;
 extern bool RemoveMatchNamespaceFilters;
 extern bool EnableOrderByIndexTerm;
 extern bool EnableGroupByCompoundIdIndexPushdown;
@@ -98,12 +98,10 @@ extern bool EnableScalarAggregateIndexPushdown;
 extern bool EnableScalarAggregateAccumulatorPathCollection;
 extern bool EnableProjectPushUpBeforeUnwindWithGroup;
 extern bool EnableSortPushToAccumulatorWithPrefix;
-extern bool EnableSampleScanFixOnSharded;
 extern bool EnableSampleScanPushdownForDynamicCursor;
 extern bool EnableDistinctIndexPushdown;
 extern bool EnableDistinctExistsFilterPushdown;
-extern bool EnableSubqueryPushdownForMatch;
-extern bool EnableDollarSampleReservoirScan;
+extern bool EnableSubqueryPushdownForMatchOnPersistedCursors;
 extern bool EnableSupportFunctionIdPushdown;
 
 /* GUC to config tdigest compression */
@@ -133,6 +131,10 @@ typedef bool (*RequiresPersistentCursorFunc)(const bson_value_t *existingValue,
  */
 typedef bool (*CanInlineLookupStage)(const bson_value_t *stageValue, const
 									 StringView *lookupPath, bool hasLet);
+
+
+typedef bool (*IsDynamicCursorFetchAllFunc)(const bson_value_t *existingValue,
+											Query *query);
 
 
 /*
@@ -175,6 +177,18 @@ typedef struct AggregationStageDefinition
 
 	/* Allow Base shard table pushdown */
 	bool allowBaseShardTablePushdown;
+
+
+	/*
+	 * Whether or not the stage requires persisted cursors
+	 * even when dynamic cursors are present.
+	 * TODO: This is temporary, until we can get the persisted costing
+	 * fixed directly in the planner when dynamic cursors decide persisted
+	 * vs streaming based on startup cost during planning.
+	 * Also note: It is by design we DO NOT want to run planning twice as a
+	 * fix for this.
+	 */
+	IsDynamicCursorFetchAllFunc isDynamicCursorFetchAllFunc;
 
 	Stage stageEnum;
 } AggregationStageDefinition;
@@ -320,11 +334,15 @@ static Query * HandleFill(const bson_value_t *existingValue, Query *query,
 						  AggregationPipelineBuildContext *context);
 static Query * HandleLimit(const bson_value_t *existingValue, Query *query,
 						   AggregationPipelineBuildContext *context);
+static Query * HandleFindLimit(const bson_value_t *existingValue, Query *query,
+							   AggregationPipelineBuildContext *context);
 static Query * HandleProject(const bson_value_t *existingValue, Query *query,
 							 AggregationPipelineBuildContext *context);
 static Query * HandleProjectFind(const bson_value_t *existingValue,
 								 const bson_value_t *queryValue, Query *query,
 								 AggregationPipelineBuildContext *context);
+static Query * HandleProjectFindStage(const bson_value_t *stageValue, Query *query,
+									  AggregationPipelineBuildContext *context);
 static Query * HandleRedact(const bson_value_t *existingValue, Query *query,
 							AggregationPipelineBuildContext *context);
 static Query * HandleReplaceRoot(const bson_value_t *existingValue, Query *query,
@@ -336,6 +354,8 @@ static Query * HandleSample(const bson_value_t *existingValue, Query *query,
 static int64_t ParseSampleSize(const bson_value_t *sizeValue);
 static Query * HandleSkip(const bson_value_t *existingValue, Query *query,
 						  AggregationPipelineBuildContext *context);
+static Query * HandleFindSkip(const bson_value_t *existingValue, Query *query,
+							  AggregationPipelineBuildContext *context);
 static Query * HandleSort(const bson_value_t *existingValue, Query *query,
 						  AggregationPipelineBuildContext *context);
 static Query * HandleSortByCount(const bson_value_t *existingValue, Query *query,
@@ -348,6 +368,8 @@ static Query * HandleDistinct(const StringView *existingValue, Query *query,
 							  AggregationPipelineBuildContext *context);
 static Query * HandleGeoNear(const bson_value_t *existingValue, Query *query,
 							 AggregationPipelineBuildContext *context);
+static Query * HandleMatchForFind(const bson_value_t *existingValue, Query *query,
+								  AggregationPipelineBuildContext *context);
 static Query * HandleMatchAggregationStage(const bson_value_t *existingValue,
 										   Query *query,
 										   AggregationPipelineBuildContext *context);
@@ -374,6 +396,8 @@ static bool CanInlineLookupStageSetAddFields(const bson_value_t *stageValue, con
 											 StringView *lookupPath, bool hasLet);
 static bool CanInlineLookupStageProject(const bson_value_t *stageValue, const
 										StringView *lookupPath, bool hasLet);
+static bool CanInlineLookupStageProjectFind(const bson_value_t *stageValue, const
+											StringView *lookupPath, bool hasLet);
 static bool CanInlineLookupStageUnset(const bson_value_t *stageValue, const
 									  StringView *lookupPath, bool hasLet);
 static bool CanInlineLookupStageUnwind(const bson_value_t *stageValue, const
@@ -396,8 +420,6 @@ static void RewriteFillToSetWindowFieldsSpec(const bson_value_t *fillSpec,
 											 bson_value_t *addFieldsForValueFill,
 											 bson_value_t *setWindowFieldsSpec,
 											 bson_value_t *partitionByFields);
-static List * TryOptimizeAggregationPipelines(List *aggregationStages,
-											  AggregationPipelineBuildContext *context);
 static bool IsPipelineStageFollowedByOtherStage(Stage firstStage, Stage secondStage,
 												int curIndx, List *stagesList);
 static List * TryInjectProjectBeforeUnwindForGroup(List *aggregationStages,
@@ -441,6 +463,10 @@ static Query * ApplyFindSpec(const FindSpec *spec, MongoCollection *collection,
 static Query * ApplyFindSpecCore(const FindSpec *spec, Query *query,
 								 QueryData *queryData, CursorParamKind cursorParamKind,
 								 AggregationPipelineBuildContext *context);
+static void ResolveDefaultCollation(MongoCollection *collection,
+									AggregationPipelineBuildContext *context);
+static void ResolveAndCaptureCollation(MongoCollection *collection, QueryData *queryData,
+									   AggregationPipelineBuildContext *context);
 static void SetStreamingSkipLimitForFind(const FindSpec *spec,
 										 MongoCollection *collection,
 										 QueryData *queryData,
@@ -454,6 +480,20 @@ static Expr * MakeBsonFullScanQual(Expr *documentExpr,
 								   const pgbsonelement *sortSpecElement,
 								   const char *collationString);
 static pgbson * BuildDynamicCursorTrackerState(const QueryData *queryData);
+
+static Query * ApplyAggregationStagesToBaseQuery(Query *baseQuery, CursorParamKind
+												 cursorParamKind,
+												 QueryData *queryData,
+												 AggregationPipelineBuildContext *context,
+												 List *aggregationStages, bool
+												 isCollectionAgnosticQuery);
+
+static bool IsPersistedDynamicCursorStageFalse(const bson_value_t *existingValue,
+											   Query *query);
+static bool IsPersistedDynamicCursorStageTrue(const bson_value_t *existingValue,
+											  Query *query);
+static bool IsPersistedDynamicCursorStageSortGroup(const bson_value_t *existingValue,
+												   Query *query);
 
 #define COMPATIBLE_CHANGE_STREAM_STAGES_COUNT 8
 const char *CompatibleChangeStreamPipelineStages[COMPATIBLE_CHANGE_STREAM_STAGES_COUNT] =
@@ -484,6 +524,7 @@ static const AggregationStageDefinition LookupUnwindStageDefinition = {
 
 	/* $lookup may touch multiple collections */
 	.isMultiJoinUnionStage = true,
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 	.stageEnum = Stage_LookupUnwind,
 };
 
@@ -501,7 +542,92 @@ static const AggregationStageDefinition SortGroupStageDefinition = {
 	.isMultiJoinUnionStage = false,
 	.pipelineCheckFunc = NULL,
 	.allowBaseShardTablePushdown = true,
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageSortGroup,
 	.stageEnum = Stage_SortGroup,
+};
+
+static const AggregationStageDefinition FindMatchStageDefinition = {
+	.stage = "$findMatch",
+	.mutateFunc = &HandleMatchForFind,
+	.requiresPersistentCursor = &RequiresPersistentCursorFalse,
+	.canInlineLookupStageFunc = &CanInlineLookupStageMatch,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = true,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
+	.stageEnum = Stage_Match,
+};
+
+static const AggregationStageDefinition FindSortStageDefinition = {
+	.stage = "$findSort",
+	.mutateFunc = &HandleSort,
+	.requiresPersistentCursor = &RequiresPersistentCursorTrue,
+	.canInlineLookupStageFunc = &CanInlineLookupStageTrue,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = false,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
+	.stageEnum = Stage_Sort,
+};
+
+static const AggregationStageDefinition FindSkipStageDefinition = {
+	.stage = "$findSkip",
+	.mutateFunc = &HandleFindSkip,
+	.requiresPersistentCursor = &RequiresPersistentCursorSkip,
+	.canInlineLookupStageFunc = NULL,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = false,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+
+	/* Handled via dynamic cursor find skip/limit separately */
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
+	.stageEnum = Stage_Skip,
+};
+
+static const AggregationStageDefinition FindLimitStageDefinition = {
+	.stage = "$findLimit",
+	.mutateFunc = &HandleFindLimit,
+	.requiresPersistentCursor = &RequiresPersistentCursorLimit,
+	.canInlineLookupStageFunc = NULL,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = false,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+
+	/* Handled via dynamic cursor find skip/limit separately */
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
+	.stageEnum = Stage_Limit,
+};
+
+static const AggregationStageDefinition ProjectFindStageDefinition = {
+	.stage = "$projectFind",
+	.mutateFunc = &HandleProjectFindStage,
+	.requiresPersistentCursor = &RequiresPersistentCursorFalse,
+	.canInlineLookupStageFunc = &CanInlineLookupStageProjectFind,
+	.preservesStableSortOrder = true,
+	.canHandleAgnosticQueries = false,
+	.isProjectTransform = true,
+	.isOutputStage = false,
+	.isMultiJoinUnionStage = false,
+	.pipelineCheckFunc = NULL,
+	.allowBaseShardTablePushdown = true,
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
+	.stageEnum = Stage_Project,
 };
 
 /*
@@ -523,6 +649,7 @@ static const AggregationStageDefinition ProjectStageDefinition = {
 	.isMultiJoinUnionStage = false,
 	.pipelineCheckFunc = NULL,
 	.allowBaseShardTablePushdown = true,
+	.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 	.stageEnum = Stage_Project,
 };
 
@@ -545,6 +672,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
 		.allowBaseShardTablePushdown = true,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.stageEnum = Stage_Internal_InhibitOptimization,
 	},
 	{
@@ -559,6 +687,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
 		.allowBaseShardTablePushdown = true,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.stageEnum = Stage_AddFields,
 	},
 	{
@@ -572,6 +701,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Bucket,
 	},
@@ -586,6 +716,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_BucketAuto,
 	},
@@ -602,6 +733,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* $changeStream may touch multiple collections or cluster level */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = PreCheckChangeStreamPipelineStages,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_ChangeStream,
 	},
@@ -617,6 +749,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
 		.allowBaseShardTablePushdown = false,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.stageEnum = Stage_CollStats,
 	},
 	{
@@ -635,6 +768,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
 		.allowBaseShardTablePushdown = true,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.stageEnum = Stage_Count,
 	},
 	{
@@ -655,6 +789,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* $currentOp may touch multiple collections via joins etc */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_CurrentOp,
 	},
@@ -669,6 +804,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Densify,
 	},
@@ -687,6 +823,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		 */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_Documents,
 	},
@@ -707,6 +844,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* $facet may handle sub-pipelines with joins */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_Facet,
 	},
@@ -721,6 +859,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Fill,
 	},
@@ -739,6 +878,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		 */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_GeoNear,
 	},
@@ -755,6 +895,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* Recursive CTE has joins with self */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_GraphLookup,
 	},
@@ -774,6 +915,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageSortGroup,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Group,
 	},
@@ -789,6 +931,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
 		.allowBaseShardTablePushdown = false,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.stageEnum = Stage_IndexStats,
 	},
 	{
@@ -808,6 +951,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* $inverseMatch joins with another collection */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_InverseMatch,
 	},
@@ -826,6 +970,9 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+
+		/* TODO - do we not want to do fast start up here? */
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Limit,
 	},
@@ -842,6 +989,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* Defensive - assume that this joins */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_ListLocalSessions,
 	},
@@ -855,6 +1003,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isProjectTransform = false,
 		.isOutputStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_ListSearchIndexes,
 	},
@@ -871,6 +1020,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* Defensive - assume that this joins */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_ListSessions,
 	},
@@ -889,6 +1039,9 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* Lookup is a left join */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+
+		/* TODO: This should be a planner decision */
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_Lookup,
 	},
@@ -907,6 +1060,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Match,
 	},
@@ -923,6 +1077,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* $merge outputs into same or different collection */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_Merge,
 	},
@@ -939,6 +1094,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* $out outputs to a new collection */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_Out,
 	},
@@ -955,6 +1111,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Project,
 	},
@@ -969,6 +1126,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Redact,
 	},
@@ -985,6 +1143,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_ReplaceRoot,
 	},
@@ -1001,6 +1160,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_ReplaceWith,
 	},
@@ -1019,6 +1179,11 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+
+		/* TODO: This can be streaming especially if it's doing the reservoir sampling
+		 * on an index.
+		 */
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Sample,
 	},
@@ -1037,6 +1202,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* Defensive: Presume it *may* join */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Search,
 	},
@@ -1053,6 +1219,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		/* Defensive: Presume it *may* join */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_SearchMeta,
 	},
@@ -1067,6 +1234,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Set,
 	},
@@ -1081,6 +1249,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_SetWindowFields,
 	},
@@ -1099,6 +1268,11 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+
+		/* TODO: This should ideally come from the Skip/Limit handling for dynamic cursors
+		 * once this is extended beyond find.
+		 */
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Skip,
 	},
@@ -1117,6 +1291,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageSortGroup,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Sort,
 	},
@@ -1132,6 +1307,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
 		.allowBaseShardTablePushdown = true,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.stageEnum = Stage_SortByCount,
 	},
 	{
@@ -1150,6 +1326,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		 */
 		.isMultiJoinUnionStage = true,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = false,
 		.stageEnum = Stage_UnionWith,
 	},
@@ -1165,6 +1342,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
 		.allowBaseShardTablePushdown = true,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageFalse,
 		.stageEnum = Stage_Unset,
 	},
 	{
@@ -1178,6 +1356,9 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+
+		/* TODO: Are there cases where this could be false for an unwind stage? */
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 		.allowBaseShardTablePushdown = true,
 		.stageEnum = Stage_Unwind,
 	},
@@ -1194,6 +1375,7 @@ static const AggregationStageDefinition StageDefinitions[] =
 		.isOutputStage = false,
 		.isMultiJoinUnionStage = false,
 		.pipelineCheckFunc = NULL,
+		.isDynamicCursorFetchAllFunc = &IsPersistedDynamicCursorStageTrue,
 
 		/* $vectorSearch is needed to be executed withing custom scan boundaries see EvaluateMetaSearchScore in vector/vector_utilities.c */
 		.allowBaseShardTablePushdown = false,
@@ -1499,9 +1681,6 @@ MutateQueryWithPipeline(Query *query, List *aggregationStages,
 								stageName)));
 		}
 
-		/* If the prior stage needed to be pushed to a sub-query before the next
-		 * stage is processed, then add a subquery stage
-		 */
 		if (context->requiresSubQuery)
 		{
 			query = MigrateQueryToSubQuery(query, context);
@@ -1537,6 +1716,9 @@ MutateQueryWithPipeline(Query *query, List *aggregationStages,
 			context->requiresPersistentCursor ||
 			definition->requiresPersistentCursor(&stage->stageValue,
 												 &context->isSingleRowResult);
+		context->requiresDynamicFetchAllCursor =
+			context->requiresDynamicFetchAllCursor ||
+			definition->isDynamicCursorFetchAllFunc(&stage->stageValue, query);
 
 		if (!definition->preservesStableSortOrder)
 		{
@@ -1564,6 +1746,7 @@ inline static void
 SetCursorTopology(QueryData *queryData,
 				  const AggregationPipelineBuildContext *context)
 {
+	queryData->requiresDynamicFetchAllCursor = context->requiresDynamicFetchAllCursor;
 	if (context->mongoCollection == NULL)
 	{
 		return;
@@ -1734,8 +1917,8 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 	AggregationQueryPlan *plan = palloc0(sizeof(AggregationQueryPlan));
 	AggregationPipelineBuildContext *context = &plan->context;
 	context->databaseNameDatum = database;
-	context->optimizePipelineStages = true;
 	context->joinStatus = JoinStageStatus_Unknown;
+	context->shouldResolveDefaultCollation = true;
 	queryData->cursorKind = QueryCursorType_Unspecified;
 	queryData->streamingLimit = 0;
 	queryData->streamingSkip = 0;
@@ -1834,6 +2017,7 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 				if (EnsureTopLevelFieldIsDocumentNullOrEmptyOk(
 						"collation", &aggregationIterator))
 				{
+					context->shouldResolveDefaultCollation = false;
 					ParseAndGetCollationString(value, context->collationString);
 				}
 			}
@@ -1888,12 +2072,14 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 
 	context->variableSpec = (Expr *) MakeBsonConst(parsedVariables);
 
+	context->allowShardBaseTable = true;
 	List *aggregationStages = ExtractAggregationStages(&pipelineValue,
 													   context);
 
 	if (context->requiresTailableCursor)
 	{
 		queryData->cursorKind = QueryCursorType_Tailable;
+		context->shouldResolveDefaultCollation = false;
 	}
 
 	/*
@@ -1910,6 +2096,8 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 			PointerGetDatum(context->databaseNameDatum), collectionNameDatum,
 			AccessShareLock);
 
+		ResolveAndCaptureCollation(collection, queryData, context);
+
 		/*
 		 * Set the namespace name now so the remote-dispatch path (which skips the
 		 * apply phase) still has it for the cursor response preamble. For the
@@ -1917,6 +2105,10 @@ ParseAggregationQueryAndLookupCollection(text *database, pgbson *aggregationSpec
 		 */
 		queryData->namespaceName = CreateNamespaceName(context->databaseNameDatum,
 													   &collectionName);
+	}
+	else
+	{
+		context->shouldResolveDefaultCollation = false;
 	}
 
 	/*
@@ -1974,14 +2166,37 @@ ApplyParsedAggregationQuery(AggregationQueryPlan *plan)
 	else
 	{
 		context->mongoCollection = plan->collection;
-		query = GenerateBaseTableQuery(context->databaseNameDatum,
-									   &plan->collectionName,
-									   plan->collectionUuid, &plan->indexHint,
-									   context);
+		List *prependedStages = NIL;
+		query = GenerateBaseTableQueryAndGetStages(context->databaseNameDatum,
+												   &plan->collectionName,
+												   plan->collectionUuid, &plan->indexHint,
+												   context,
+												   &prependedStages);
+		if (prependedStages != NIL)
+		{
+			aggregationStages = list_concat(prependedStages, aggregationStages);
+		}
 	}
 
+	query = ApplyAggregationStagesToBaseQuery(query, cursorParamKind, queryData, context,
+											  aggregationStages,
+											  plan->isCollectionAgnosticQuery);
+
+	return query;
+}
+
+
+static Query *
+ApplyAggregationStagesToBaseQuery(Query *baseQuery, CursorParamKind cursorParamKind,
+								  QueryData *queryData,
+								  AggregationPipelineBuildContext *context,
+								  List *aggregationStages, bool isCollectionAgnosticQuery)
+{
 	/* Remember the base query - this will be needed since we need to update the cursor function on the base RTE */
-	Query *baseQuery = query;
+	Query *query = baseQuery;
+
+	/* First optimize aggregation pipeline stages */
+	aggregationStages = TryOptimizeAggregationPipelines(aggregationStages, context);
 
 	if (cursorParamKind == CursorParamKind_Dynamic &&
 		!TryAddDynamicCursorQuery(cursorParamKind, queryData, query, context))
@@ -2013,7 +2228,7 @@ ApplyParsedAggregationQuery(AggregationQueryPlan *plan)
 	else if (queryData->cursorKind == QueryCursorType_Unspecified)
 	{
 		queryData->cursorKind =
-			context->requiresPersistentCursor || plan->isCollectionAgnosticQuery ?
+			context->requiresPersistentCursor || isCollectionAgnosticQuery ?
 			QueryCursorType_Persistent : QueryCursorType_Streamable;
 	}
 
@@ -2189,6 +2404,7 @@ ParseFindQuery(pgbson *findSpec, QueryData *queryData,
 												BSON_TYPE_DOCUMENT);
 						if (!IsBsonValueEmptyDocument(value))
 						{
+							context->shouldResolveDefaultCollation = false;
 							ParseAndGetCollationString(value,
 													   context->collationString);
 						}
@@ -2483,6 +2699,61 @@ default_find_case:
 }
 
 
+static List *
+BuildAggregationStagesForFind(List *aggregationStages, const FindSpec *spec)
+{
+	if (spec->filter.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindMatchStageDefinition;
+		stage->stageValue = spec->filter;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->sort.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindSortStageDefinition;
+		stage->stageValue = spec->sort;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->skip.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindSkipStageDefinition;
+		stage->stageValue = spec->skip;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->limit.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		stage->stageDefinition = &FindLimitStageDefinition;
+		stage->stageValue = spec->limit;
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	if (spec->projection.value_type != BSON_TYPE_EOD)
+	{
+		AggregationStage *stage = palloc0(sizeof(AggregationStage));
+		pgbson_writer writer;
+		PgbsonWriterInit(&writer);
+		PgbsonWriterAppendValue(&writer, "projection", 10, &spec->projection);
+		if (spec->filter.value_type != BSON_TYPE_EOD)
+		{
+			PgbsonWriterAppendValue(&writer, "filter", 6, &spec->filter);
+		}
+
+		stage->stageDefinition = &ProjectFindStageDefinition;
+		stage->stageValue = ConvertPgbsonToBsonValue(PgbsonWriterGetPgbson(&writer));
+		aggregationStages = lappend(aggregationStages, stage);
+	}
+
+	return aggregationStages;
+}
+
+
 /*
  * Looks up the collection, sets context fields, and calls ApplyFindSpecCore.
  */
@@ -2511,14 +2782,22 @@ ApplyFindSpec(const FindSpec *spec, MongoCollection *collection,
 	}
 	context->mongoCollection = collection;
 
-	Query *query = GenerateBaseTableQuery(spec->databaseDatum, &spec->collectionName,
-										  spec->collectionUuid, &spec->indexHint,
-										  context);
+	List *aggregationStages = NIL;
+	Query *query = GenerateBaseTableQueryAndGetStages(spec->databaseDatum,
+													  &spec->collectionName,
+													  spec->collectionUuid,
+													  &spec->indexHint,
+													  context,
+													  &aggregationStages);
 
-	Query *finalQuery = ApplyFindSpecCore(spec, query, queryData,
-										  cursorParamKind, context);
+	if (aggregationStages == NIL)
+	{
+		return ApplyFindSpecCore(spec, query, queryData, cursorParamKind, context);
+	}
 
-	return finalQuery;
+	aggregationStages = BuildAggregationStagesForFind(aggregationStages, spec);
+	return ApplyAggregationStagesToBaseQuery(query, cursorParamKind, queryData,
+											 context, aggregationStages, false);
 }
 
 
@@ -2632,7 +2911,7 @@ ApplyFindSpecCore(const FindSpec *spec, Query *query,
 	/* First apply match */
 	if (spec->filter.value_type != BSON_TYPE_EOD)
 	{
-		query = HandleMatch(&spec->filter, query, context);
+		query = HandleMatchForFind(&spec->filter, query, context);
 		context->stageNum++;
 	}
 
@@ -2646,39 +2925,22 @@ ApplyFindSpecCore(const FindSpec *spec, Query *query,
 	/* Then do skip and then limit */
 	if (spec->skip.value_type != BSON_TYPE_EOD)
 	{
-		query = HandleSkip(&spec->skip, query, context);
+		query = HandleFindSkip(&spec->skip, query, context);
 		context->stageNum++;
 	}
 
 	if (spec->limit.value_type != BSON_TYPE_EOD)
 	{
-		query = HandleLimit(&spec->limit, query, context);
+		query = HandleFindLimit(&spec->limit, query, context);
 		context->stageNum++;
 	}
 
 	/* Projection migration wraps this query but leaves it as the count owner. */
 	Query *skipLimitQuery = query;
 
-	/* $near and $nearSphere add sort clause to query, for them we need persistent cursor. */
-	if (query->sortClause)
-	{
-		context->requiresPersistentCursor = true;
-	}
-
 	/* finally update projection */
 	if (spec->projection.value_type != BSON_TYPE_EOD)
 	{
-		/* Before applying projection - check if we need to
-		 * push to a subquery. We do this only if we have
-		 * skip to avoid projecting on documents we won't need.
-		 */
-		if (context->requiresSubQuery &&
-			context->requiresPersistentCursor &&
-			query->limitOffset != NULL)
-		{
-			query = MigrateQueryToSubQuery(query, context);
-		}
-
 		query = HandleProjectFind(&spec->projection, &spec->filter, query, context);
 	}
 
@@ -2762,6 +3024,7 @@ ParseFindQueryAndLookupCollection(text *database, pgbson *findSpec,
 	/* For finds, we can generally query the shard directly if available. */
 	plan->context.allowShardBaseTable = true;
 	plan->context.databaseNameDatum = database;
+	plan->context.shouldResolveDefaultCollation = true;
 
 	/* Find queries have no joins */
 	plan->context.joinStatus = JoinStageStatus_NoJoinsOrUnions;
@@ -2773,6 +3036,8 @@ ParseFindQueryAndLookupCollection(text *database, pgbson *findSpec,
 		PointerGetDatum(cstring_to_text_with_len(plan->spec.collectionName.string,
 												 plan->spec.collectionName.length)),
 		AccessShareLock);
+
+	ResolveAndCaptureCollation(plan->collection, queryData, &plan->context);
 
 	/*
 	 * Set the namespace name now so the remote-dispatch path (which skips
@@ -2904,6 +3169,7 @@ GenerateCountQuery(text *databaseDatum, pgbson *countSpec, bool setStatementTime
 	AggregationPipelineBuildContext context = { 0 };
 	context.databaseNameDatum = databaseDatum;
 	context.joinStatus = JoinStageStatus_Unknown;
+	context.shouldResolveDefaultCollation = true;
 
 	bson_iter_t countIterator;
 	PgbsonInitIterator(countSpec, &countIterator);
@@ -2973,6 +3239,7 @@ GenerateCountQuery(text *databaseDatum, pgbson *countSpec, bool setStatementTime
 				if (EnsureTopLevelFieldIsDocumentNullOrEmptyOk(
 						"collation", &countIterator))
 				{
+					context.shouldResolveDefaultCollation = false;
 					ParseAndGetCollationString(value, context.collationString);
 				}
 			}
@@ -3015,12 +3282,21 @@ GenerateCountQuery(text *databaseDatum, pgbson *countSpec, bool setStatementTime
 
 	Query *query = GenerateBaseTableQuery(databaseDatum, &collectionName, collectionUuid,
 										  &indexHint, &context);
+	if (context.requiresSubQuery)
+	{
+		query = MigrateQueryToSubQuery(query, &context);
+	}
+
+	bool isView = context.mongoCollection != NULL &&
+				  strcmp(collectionName.string,
+						 context.mongoCollection->name.collectionName) != 0;
 
 	/*
 	 * the count() query which has no filter/skip/limit/etc can be done via an estimatedDocumentCount
 	 * In this case, we rewrite the query as a collStats aggregation query with a project to make it the appropriate output.
 	 */
-	if (!hasQueryModifier && context.mongoCollection != NULL)
+	if (!hasQueryModifier && context.mongoCollection != NULL &&
+		!isView)
 	{
 		/* Collection exists, get a collStats: { "count": {} } */
 		pgbson_writer collStatsWriter;
@@ -3148,6 +3424,9 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 	context.databaseNameDatum = databaseDatum;
 	context.joinStatus = JoinStageStatus_Unknown;
 
+	/* Distinct supports collation starting with version 1.1. */
+	context.shouldResolveDefaultCollation = IsClusterVersionAtleast(DocDB_V1, 1, 0);
+
 	bson_iter_t distinctIter;
 	PgbsonInitIterator(distinctSpec, &distinctIter);
 
@@ -3203,6 +3482,7 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 				if (EnsureTopLevelFieldIsDocumentNullOrEmptyOk(
 						"collation", &distinctIter))
 				{
+					context.shouldResolveDefaultCollation = false;
 					ParseAndGetCollationString(value, context.collationString);
 				}
 			}
@@ -3264,6 +3544,10 @@ GenerateDistinctQuery(text *databaseDatum, pgbson *distinctSpec, bool setStateme
 	context.allowShardBaseTable = true;
 	Query *query = GenerateBaseTableQuery(databaseDatum, &collectionName, collectionUuid,
 										  &indexHint, &context);
+	if (context.requiresSubQuery)
+	{
+		query = MigrateQueryToSubQuery(query, &context);
+	}
 
 	/* First apply match */
 	if (filter.value_type != BSON_TYPE_EOD)
@@ -3320,7 +3604,7 @@ ParseGetMore(text **databaseName, pgbson *getMoreSpec, QueryData *queryData, boo
 			EnsureTopLevelFieldIsNumberLike("getMore.maxTimeMS", value);
 			int32_t maxTimeMS = BsonValueAsInt32(value);
 
-			if (EnableTailableCursorMaxAwaitTime && isTailableCursor)
+			if (isTailableCursor)
 			{
 				/*
 				 * For tailable cursors such as change streams, drivers stash the
@@ -3338,10 +3622,6 @@ ParseGetMore(text **databaseName, pgbson *getMoreSpec, QueryData *queryData, boo
 			{
 				/*
 				 * For regular cursors, maxTimeMS is a statement timeout.
-				 * Also the fallback path when the maxAwaitTimeMS feature is
-				 * disabled via the EnableTailableCursorMaxAwaitTime kill switch:
-				 * we revert to the pre-feature behavior of treating maxTimeMS
-				 * as a statement timeout for tailable cursors as well.
 				 */
 				SetExplicitStatementTimeout(maxTimeMS);
 			}
@@ -4481,6 +4761,16 @@ HandleProjectFind(const bson_value_t *existingValue, const bson_value_t *queryVa
 		return query;
 	}
 
+	/* Before applying projection - check if we need to
+	 * push to a subquery. We do this only if we have
+	 * skip to avoid projecting on documents we won't need.
+	 */
+	if (context->requiresPersistentCursor &&
+		query->limitOffset != NULL)
+	{
+		query = MigrateQueryToSubQuery(query, context);
+	}
+
 	/* The first projector is the document */
 	TargetEntry *firstEntry = linitial(query->targetList);
 
@@ -4534,6 +4824,34 @@ HandleProjectFind(const bson_value_t *existingValue, const bson_value_t *queryVa
 
 	firstEntry->expr = (Expr *) resultExpr;
 	return query;
+}
+
+
+static Query *
+HandleProjectFindStage(const bson_value_t *stageValue, Query *query,
+					   AggregationPipelineBuildContext *context)
+{
+	EnsureTopLevelFieldValueType("$projectFind", stageValue, BSON_TYPE_DOCUMENT);
+
+	bson_value_t projection = { .value_type = BSON_TYPE_EOD };
+	bson_value_t filter = { .value_type = BSON_TYPE_EOD };
+	bson_iter_t stageIter;
+	BsonValueInitIterator(stageValue, &stageIter);
+	while (bson_iter_next(&stageIter))
+	{
+		const char *key = bson_iter_key(&stageIter);
+		if (strcmp(key, "projection") == 0)
+		{
+			projection = *bson_iter_value(&stageIter);
+		}
+		else if (strcmp(key, "filter") == 0)
+		{
+			filter = *bson_iter_value(&stageIter);
+		}
+	}
+
+	Assert(projection.value_type != BSON_TYPE_EOD);
+	return HandleProjectFind(&projection, &filter, query, context);
 }
 
 
@@ -4637,6 +4955,16 @@ HandleSkip(const bson_value_t *existingValue, Query *query,
 }
 
 
+static Query *
+HandleFindSkip(const bson_value_t *existingValue, Query *query,
+			   AggregationPipelineBuildContext *context)
+{
+	query = HandleSkip(existingValue, query, context);
+	context->requiresSubQuery = false;
+	return query;
+}
+
+
 /*
  * Mutates the query for the $limit stage
  * Simply updates the limit in the current query.
@@ -4711,6 +5039,16 @@ HandleLimit(const bson_value_t *existingValue, Query *query,
 }
 
 
+static Query *
+HandleFindLimit(const bson_value_t *existingValue, Query *query,
+				AggregationPipelineBuildContext *context)
+{
+	query = HandleLimit(existingValue, query, context);
+	context->requiresSubQuery = false;
+	return query;
+}
+
+
 /*
  * Mutates the query for the $match stage.
  * Simply calls the ExpandQueryOperator similar to the @@ operator.
@@ -4739,8 +5077,9 @@ HandleMatchWithIndexFilter(const bson_value_t *existingValue, Query *query,
 	TargetEntry *entry = linitial(query->targetList);
 
 	if (context->joinStatus == JoinStageStatus_NoJoinsOrUnions &&
-		EnableSubqueryPushdownForMatch &&
-		EnableDynamicCursors &&
+		(EnableDynamicCursors ||
+		 (EnableSubqueryPushdownForMatchOnPersistedCursors &&
+		  context->requiresPersistentCursor)) &&
 		IsA(entry->expr, FuncExpr))
 	{
 		/* If we're not doing a filter on a Var field and it's being
@@ -4751,6 +5090,15 @@ HandleMatchWithIndexFilter(const bson_value_t *existingValue, Query *query,
 		 * To achieve this and ensure that subquery pullup works, we add an
 		 * offset 0 (since offset 0) is skipped by the planner but not by
 		 * the subquery optimizer, and push it to a subquery.
+		 * This benefits dynamic cursors as well as persisted cursors:
+		 * persisted cursors track continuation via query-level draining
+		 * (portal/file position), not by reaching into scan nodes, so the
+		 * added SubqueryScan is transparent and needs no extra handling.
+		 * For persisted cursors we only do this when the pipeline already
+		 * resolves to a persistent cursor: the added SubqueryScan cannot be
+		 * streamed over, so applying it to a streaming-eligible pipeline would
+		 * force it onto a persistent cursor, which is a regression. Dynamic
+		 * cursors see through the SubqueryScan, so they are unaffected.
 		 * TODO: Be more aggressive in the subquery pushdown (not just if
 		 * there exists a $lookup somewhere in the pipeline).
 		 */
@@ -4799,6 +5147,23 @@ HandleMatch(const bson_value_t *existingValue, Query *query,
 			AggregationPipelineBuildContext *context)
 {
 	return HandleMatchWithIndexFilter(existingValue, query, context, NULL);
+}
+
+
+static Query *
+HandleMatchForFind(const bson_value_t *existingValue, Query *query,
+				   AggregationPipelineBuildContext *context)
+{
+	int sortClauseCount = list_length(query->sortClause);
+	query = HandleMatch(existingValue, query, context);
+
+	/* $near and $nearSphere add an ordering that requires a persistent cursor. */
+	if (list_length(query->sortClause) > sortClauseCount)
+	{
+		context->requiresPersistentCursor = true;
+	}
+
+	return query;
 }
 
 
@@ -7143,15 +7508,19 @@ AddGroupExpression(Expr *expression, ParseState *parseState, char *identifiers,
 
 
 /*
- * Given an accumulator expression, checks whether it can be statically
- * evaluated to a const. If it can, then returns a const "Expr".
- * If not, returns the original docExpr.
+ * Checks whether a group expression is constant under the supplied collation.
+ * Constant expressions do not need the input document.
  */
 static Expr *
 GetDocumentExprForGroupAccumulatorValue(const bson_value_t *accumulatorValue,
-										Expr *docExpr)
+										Expr *docExpr, const char *collationString)
 {
 	ParseAggregationExpressionContext parseContext = { 0 };
+	if (IsCollationApplicable(collationString))
+	{
+		parseContext.collationString = collationString;
+	}
+
 	AggregationExpressionData expressionData;
 	memset(&expressionData, 0, sizeof(AggregationExpressionData));
 
@@ -7280,7 +7649,8 @@ AddSimpleGroupAccumulator(Query *query, const bson_value_t *accumulatorValue,
 												  accumulatorValue));
 
 	documentExpr = GetDocumentExprForGroupAccumulatorValue(accumulatorValue,
-														   documentExpr);
+														   documentExpr,
+														   collationString);
 
 	FuncExpr *accumFunc = MakeGroupAccumulatorExpressionGet(documentExpr, constValue,
 															variableSpec,
@@ -7310,7 +7680,8 @@ AddSimpleGroupAccumulatorWithExpr(Query *query, const bson_value_t *accumulatorV
 	Expr *exprConst = (Expr *) MakeBsonConst(BsonValueToDocumentPgbson(accumulatorValue));
 
 	documentExpr = GetDocumentExprForGroupAccumulatorValue(accumulatorValue,
-														   documentExpr);
+														   documentExpr,
+														   context->collationString);
 
 	if (IsDistributedShardContext(context) &&
 		BsonTypeId() != DocumentDBCoreBsonTypeId())
@@ -7936,8 +8307,9 @@ HandleGroupCore(const bson_value_t *existingValue, Query *query,
 	List *groupArgs;
 	Oid bsonExpressionGetFunction;
 
-	Expr *transformedGroupExpr = GetDocumentExprForGroupAccumulatorValue(&idValue,
-																		 origEntry->expr);
+	Expr *transformedGroupExpr =
+		GetDocumentExprForGroupAccumulatorValue(&idValue, origEntry->expr,
+												context->collationString);
 	bool isGroupConstant = IsA(transformedGroupExpr, Const);
 
 	/* Now do the projector / accumulators
@@ -7990,7 +8362,7 @@ HandleGroupCore(const bson_value_t *existingValue, Query *query,
 			const bson_value_t *fieldVal = bson_iter_value(&fieldIter);
 			pgbson *fieldGroupValue = BsonValueToDocumentPgbson(fieldVal);
 			Expr *fieldDocExpr = GetDocumentExprForGroupAccumulatorValue(
-				fieldVal, origEntry->expr);
+				fieldVal, origEntry->expr, context->collationString);
 
 			FuncExpr *fieldGroupFunc;
 			if (IsCollationApplicable(context->collationString))
@@ -8268,14 +8640,9 @@ HandleGroupCore(const bson_value_t *existingValue, Query *query,
 
 			if (!IsBsonValueEmptyDocument(&accumulatorElement.bsonValue))
 			{
-				ReportFeatureUsage(FEATURE_AGGREGATE_GROUP_COUNT_WITH_ARG);
-
-				if (FailOnNonEmptyGroupCountArg)
-				{
-					ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_TYPEMISMATCH),
-									errmsg(
-										"$count:{} accumulator requires 0 arguments")));
-				}
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_TYPEMISMATCH),
+								errmsg(
+									"$count:{} accumulator requires 0 arguments")));
 			}
 
 			/* Use the new BSONCOUNT aggregate. */
@@ -9132,6 +9499,18 @@ RequiresPersistentCursorLimit(const bson_value_t *pipelineValue, bool *isSingleR
 	if (pipelineValue->value_type != BSON_TYPE_EOD &&
 		BsonValueIsNumber(pipelineValue))
 	{
+		bool checkFixedInteger = true;
+		if (!IsBsonValue64BitInteger(pipelineValue, checkFixedInteger))
+		{
+			/* A numeric value that cannot be expressed as a 64-bit integer
+			 * (e.g. NaN or out of range). BsonValueAsInt64 would raise a
+			 * generic conversion error here; defer to ParseLimitValue in the
+			 * stage handler to raise the specific validation error, and treat
+			 * the stage conservatively as persistence-requiring.
+			 */
+			return true;
+		}
+
 		int64_t limit = BsonValueAsInt64(pipelineValue);
 		if (limit == 1)
 		{
@@ -9160,6 +9539,18 @@ RequiresPersistentCursorSkip(const bson_value_t *pipelineValue, bool *isSingleRo
 	if (pipelineValue->value_type != BSON_TYPE_EOD &&
 		BsonValueIsNumber(pipelineValue))
 	{
+		bool checkFixedInteger = true;
+		if (!IsBsonValueUnquantized64BitInteger(pipelineValue, checkFixedInteger))
+		{
+			/* A numeric value that cannot be expressed as a 64-bit integer
+			 * (e.g. NaN or out of range). BsonValueAsInt64 would raise a
+			 * generic conversion error here; defer to ParseSkipValue in the
+			 * stage handler to raise the specific validation error, and treat
+			 * the stage conservatively as persistence-requiring.
+			 */
+			return true;
+		}
+
 		int64_t skip = BsonValueAsInt64(pipelineValue);
 		return skip != 0;
 	}
@@ -9237,7 +9628,6 @@ ExtractViewDefinitionAndPipeline(Datum databaseDatum, pgbson *viewDefinition,
 /*
  * Given the pipeline definition extract the stages as a list of `AggregationStage`.
  * Performs basic validation in the structure of the pipeline.
- * If `context->optimizePipelines` is set to true, the function will optimize the pipelines.
  */
 List *
 ExtractAggregationStages(const bson_value_t *pipelineValue,
@@ -9327,6 +9717,11 @@ ExtractAggregationStages(const bson_value_t *pipelineValue,
 			context->joinStatus = JoinStageStatus_HasJoinsOrUnions;
 		}
 
+		if (!definition->allowBaseShardTablePushdown)
+		{
+			context->allowShardBaseTable = false;
+		}
+
 		if (definition->stageEnum == Stage_ChangeStream)
 		{
 			context->requiresTailableCursor = true;
@@ -9337,6 +9732,48 @@ ExtractAggregationStages(const bson_value_t *pipelineValue,
 		stage->stageValue = stageElement.bsonValue;
 
 		aggregationStages = lappend(aggregationStages, stage);
+
+		/*
+		 * Determine up front whether the fully resolved query will resolve to a
+		 * persistent cursor. requiresPersistentCursor is otherwise only known
+		 * incrementally during mutation (a stage sees the stages before it, but
+		 * not after it), so a stage that wants to avoid forcing a
+		 * streaming-eligible pipeline onto a persistent cursor has no way to see
+		 * a later persistence-forcing stage (e.g. a trailing $sort). Raise
+		 * requiresPersistentCursor here, while resolving the stage list, so the
+		 * decision is available to every stage when the pipeline is later
+		 * mutated. Pipeline optimization runs after extraction and only
+		 * simplifies or removes stages (never introduces a new
+		 * persistence-forcing stage), so this pre-optimization raise can only
+		 * ever be conservative: it raises requiresPersistentCursor in a superset
+		 * of the cases the per-stage accumulation during mutation would, which
+		 * is safe because the value is monotonic and mutation still accumulates
+		 * on the optimized stages.
+		 *
+		 * requiresPersistentCursor is monotonic (only ever raised from false to
+		 * true). ExtractAggregationStages also runs for sub-pipeline extracts
+		 * (e.g. resolved views) on the same context, and each such extract ORs
+		 * in its own stages' forces; because the value only ever climbs, those
+		 * extracts can only raise it, so by the time the outer pipeline is
+		 * mutated it reflects whether any stage anywhere in the query forces
+		 * persistence.
+		 *
+		 * The early raise is only needed by the persisted-cursor $match pushdown
+		 * gate in HandleMatchWithIndexFilter, which short-circuits on
+		 * EnableSubqueryPushdownForMatchOnPersistedCursors. Gate the check on the
+		 * same GUC so that when the feature is off there is zero added work and
+		 * the prior code path is preserved.
+		 */
+		if (EnableSubqueryPushdownForMatchOnPersistedCursors &&
+			!context->requiresPersistentCursor)
+		{
+			bool ignoreSingleRowResult = false;
+			if (definition->requiresPersistentCursor(&stage->stageValue,
+													 &ignoreSingleRowResult))
+			{
+				context->requiresPersistentCursor = true;
+			}
+		}
 	}
 
 	/*
@@ -9347,11 +9784,6 @@ ExtractAggregationStages(const bson_value_t *pipelineValue,
 	 * fail. This is a tradeoff for perf b/w most of the valid cases v/s the rare invalid ones.
 	 */
 	CheckMaxAllowedAggregationStages(list_length(aggregationStages));
-
-	if (context->optimizePipelineStages)
-	{
-		aggregationStages = TryOptimizeAggregationPipelines(aggregationStages, context);
-	}
 
 	if (context->joinStatus == JoinStageStatus_Unknown)
 	{
@@ -9422,13 +9854,74 @@ FillRteForMongoCollection(Query *query, RangeTblEntry *rte,
 }
 
 
-/*
- * Updates the base table
- */
+static void
+ResolveAndCaptureCollation(MongoCollection *collection, QueryData *queryData,
+						   AggregationPipelineBuildContext *context)
+{
+	if (!EnableCollation)
+	{
+		context->shouldResolveDefaultCollation = false;
+		return;
+	}
+
+	/*
+	 * shouldResolveDefaultCollation is transient parse state: it is true when
+	 * the command did not provide an explicit collation. hasCapturedCollation
+	 * is durable cursor state and remains true after the effective value has
+	 * been captured, including when the value is empty for binary semantics.
+	 */
+	if (context->shouldResolveDefaultCollation)
+	{
+		if (queryData->hasCapturedCollation)
+		{
+			/* Reuse the retained value instead of reading collection metadata again. */
+			strlcpy((char *) context->collationString,
+					queryData->collationString,
+					sizeof(context->collationString));
+		}
+		else
+		{
+			/* A new query resolves the inherited collection default once. */
+			ResolveDefaultCollation(collection, context);
+		}
+
+		context->shouldResolveDefaultCollation = false;
+	}
+
+	/* An empty value is resolved binary semantics, not missing state. */
+	queryData->hasCapturedCollation = true;
+	strlcpy(queryData->collationString, context->collationString,
+			sizeof(queryData->collationString));
+}
+
+
+static void
+ResolveDefaultCollation(MongoCollection *collection,
+						AggregationPipelineBuildContext *context)
+{
+	if (!EnableCollation)
+	{
+		return;
+	}
+
+	if (collection == NULL ||
+		!IsCollationApplicable(collection->options.collationString))
+	{
+		return;
+	}
+
+	strlcpy((char *) context->collationString, collection->options.collationString,
+			sizeof(context->collationString));
+}
+
+
 Query *
-GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView,
-					   pg_uuid_t *collectionUuid, const bson_value_t *indexHint,
-					   AggregationPipelineBuildContext *context)
+GenerateBaseTableQueryAndGetStages(text *databaseDatum, const
+								   StringView *collectionNameView,
+								   pg_uuid_t *collectionUuid, const
+								   bson_value_t *indexHint,
+								   AggregationPipelineBuildContext *context,
+								   List **pipelineStagesToApply)
 {
 	Query *query = makeNode(Query);
 	query->commandType = CMD_SELECT;
@@ -9470,6 +9963,12 @@ GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView
 								"Namespace %s contains a mismatch in the collectionUUID identifier",
 								context->namespaceName)));
 		}
+	}
+
+	if (context->shouldResolveDefaultCollation)
+	{
+		ResolveDefaultCollation(collection, context);
+		context->shouldResolveDefaultCollation = false;
 	}
 
 	List *pipelineStages = NIL;
@@ -9673,12 +10172,41 @@ GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView
 		}
 	}
 
-	/* Now if there's pipeline stages, apply the stages in reverse (innermost first) */
-	for (int i = list_length(pipelineStages) - 1; i >= 0; i--)
+	if (list_length(pipelineStages) > 0)
 	{
-		List *stages = list_nth(pipelineStages, i);
-		query = MutateQueryWithPipeline(query, stages, context);
+		/* Now if there's pipeline stages, apply the stages in reverse (innermost first) */
+		for (int i = list_length(pipelineStages) - 1; i >= 0; i--)
+		{
+			List *stages = list_nth(pipelineStages, i);
+			*pipelineStagesToApply = list_concat(*pipelineStagesToApply, stages);
+			list_free(stages);
+		}
+
+		list_free(pipelineStages);
 	}
+
+	return query;
+}
+
+
+/*
+ * Updates the base table
+ */
+Query *
+GenerateBaseTableQuery(text *databaseDatum, const StringView *collectionNameView,
+					   pg_uuid_t *collectionUuid, const bson_value_t *indexHint,
+					   AggregationPipelineBuildContext *context)
+{
+	List *pipelineStages = NIL;
+	Query *query = GenerateBaseTableQueryAndGetStages(databaseDatum, collectionNameView,
+													  collectionUuid, indexHint, context,
+													  &pipelineStages);
+
+	if (pipelineStages != NIL)
+	{
+		query = MutateQueryWithPipeline(query, pipelineStages, context);
+	}
+	list_free(pipelineStages);
 
 	return query;
 }
@@ -9966,13 +10494,13 @@ HandleSample(const bson_value_t *existingValue, Query *query,
 			rte->tablesample = tablesample_sys_rows;
 		}
 	}
-	else if (EnableDollarSampleReservoirScan && rte->rtekind == RTE_RELATION &&
+	else if (rte->rtekind == RTE_RELATION &&
 			 context->mongoCollection != NULL &&
 			 context->mongoCollection->shardKey == NULL &&
 			 sampleSize <= GetMaxReservoirSampleSize())
 	{
 		/*
-		 * When reservoir sampling is enabled, the target is a base relation,
+		 * When the target is a base relation,
 		 * and the collection is NOT sharded, emit a bson_dollar_range qual
 		 * with a "sample" parameter. The set_rel_pathlist_hook detects this
 		 * and wraps the scan paths with a ReservoirSample CustomPath that
@@ -10122,7 +10650,7 @@ IsSampleScanEligibleJoinTree(Node *node)
 	 * so HandleSample would conclude there was a user filter and skip
 	 * the TABLESAMPLE optimization.
 	 */
-	if (EnableSampleScanFixOnSharded && IsBooleanTrueConst(node))
+	if (IsBooleanTrueConst(node))
 	{
 		return true;
 	}
@@ -10417,6 +10945,26 @@ CanInlineLookupStageProject(const bson_value_t *stageValue, const
 }
 
 
+static bool
+CanInlineLookupStageProjectFind(const bson_value_t *stageValue, const
+								StringView *lookupPath, bool hasLet)
+{
+	if (stageValue->value_type != BSON_TYPE_DOCUMENT)
+	{
+		return false;
+	}
+
+	bson_iter_t stageIter;
+	BsonValueInitIterator(stageValue, &stageIter);
+	if (!bson_iter_find(&stageIter, "projection"))
+	{
+		return false;
+	}
+
+	return CanInlineLookupStageProject(bson_iter_value(&stageIter), lookupPath, hasLet);
+}
+
+
 /*
  * Helper for an unset stage on whether it can be inlined for a $lookup.
  */
@@ -10640,7 +11188,7 @@ HandleMatchAggregationStage(const bson_value_t *existingValue, Query *query,
  * 2- Improve match stage if preceded by a projection stage and the filter is on a renamed field which could
  *    potentially use index.
  */
-static List *
+List *
 TryOptimizeAggregationPipelines(List *aggregationStages,
 								AggregationPipelineBuildContext *context)
 {
@@ -10650,11 +11198,6 @@ TryOptimizeAggregationPipelines(List *aggregationStages,
 		return stagesList;
 	}
 
-	/* Whether or not we can safely push the aggregation pipeline query to the shard table directly depends on
-	 * if all the stages refer to a single collection and it is not sharded, only in this case it is feasible to push
-	 * these queries directly to shard table.
-	 */
-	bool allowShardBaseTable = true;
 	int nextIndex = 0;
 	int currentIndex = 0;
 
@@ -10687,13 +11230,6 @@ TryOptimizeAggregationPipelines(List *aggregationStages,
 
 		nextIndex = currentIndex + 1;
 		AggregationStage *stage = (AggregationStage *) lfirst(cell);
-		const AggregationStageDefinition *definition = stage->stageDefinition;
-		if (!definition->allowBaseShardTablePushdown)
-		{
-			/* If any stage doesn't support it the final value is not supported */
-			allowShardBaseTable = false;
-		}
-
 		Stage stageEnum = stage->stageDefinition->stageEnum;
 
 		/* Project-pushup disqualifier: any non-Unwind/Match/Group
@@ -10832,8 +11368,6 @@ TryOptimizeAggregationPipelines(List *aggregationStages,
 			}
 		}
 	}
-
-	context->allowShardBaseTable = allowShardBaseTable;
 
 	/* The rewrite can fire iff no disqualifying event was seen and the
 	 * per-stage walk found the complete $unwind ... $match* ... $group
@@ -11652,4 +12186,70 @@ BuildSyntheticInclusionProjectStage(HTAB *consumedFields, bool includeId)
 	projStage->stageValue = ConvertPgbsonToBsonValue(
 		PgbsonWriterGetPgbson(&projWriter));
 	return projStage;
+}
+
+
+static bool
+IsPersistedDynamicCursorStageFalse(const bson_value_t *existingValue, Query *query)
+{
+	return false;
+}
+
+
+static bool
+IsPersistedDynamicCursorStageTrue(const bson_value_t *existingValue, Query *query)
+{
+	return true;
+}
+
+
+static bool
+IsPersistedDynamicCursorStageSortGroup(const bson_value_t *existingValue, Query *query)
+{
+	/* For a sort or group stage, it's considered streaming IF the base query is pointing to
+	 * a base table RTE. Otherwise, it counts as persistent (a group or sort on a subquery)
+	 * cannot push down to indexes anyway.
+	 * TODO: Pull up subqueries *could* eliminate this - should we consider revisiting.
+	 */
+
+	if (list_length(query->rtable) != 1)
+	{
+		return true;
+	}
+
+	RangeTblEntry *rte = linitial(query->rtable);
+	if (rte->rtekind == RTE_SUBQUERY)
+	{
+		/* For a subquery, we can consider this potentially streamable
+		 * if the projections from the query are Vars and the subquery supports
+		 * streaming group/sort - this is a proxy to the SS Pull up subqueries that
+		 * may happen later. Essentially, if the projector is a FuncExpr - we currently
+		 * will not consider it streamable.
+		 * TODO: This may change with match/group pushup optimizations.
+		 */
+		List *tle = query->targetList;
+		ListCell *cell;
+		foreach(cell, tle)
+		{
+			TargetEntry *targetEntry = (TargetEntry *) lfirst(cell);
+			if (targetEntry->resjunk)
+			{
+				continue;
+			}
+
+			if (!IsA(targetEntry->expr, Var))
+			{
+				/* If any projection is not a Var, consider it not streamable */
+				return true;
+			}
+		}
+
+		/* Not the best catch-all but consider it a pretty good proxy for now. Let the planner
+		 * decide what's best here.
+		 */
+		return false;
+	}
+
+	/* RTE's that are not baserels - just default to persistent */
+	return rte->rtekind != RTE_RELATION;
 }

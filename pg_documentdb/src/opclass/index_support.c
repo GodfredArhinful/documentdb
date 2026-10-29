@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/opclass/index_support.c
  *
@@ -235,6 +236,15 @@ typedef struct InPrefixOpInfo
 {
 	/* The index column the $in prefix maps to. */
 	AttrNumber indexcol;
+
+	/*
+	 * The composite-opclass column this $in was expanded from. Distinct from
+	 * indexcol, which on a composite index is the single shared document column
+	 * and therefore identical for every $in. Used to build the exploded-column
+	 * bitmask that decides whether the merge needs heap-TID de-duplication.
+	 */
+	int32_t compositeColumn;
+
 	Expr *leftExpr;
 
 	/* One bson Const per $in value, each of the form { "<path>": <value> }, ready to be the right-hand argument of a point-equality (@=) operator */
@@ -338,7 +348,6 @@ extern bool EnableOrderByIndexTerm;
 extern bool EnableIndexOnlyScanForFindProject;
 extern bool EnableMultiKeyFilterIndexOnlyScan;
 extern bool TrackIndexOnlyScanFindCandidate;
-extern bool EnableObjectIdFuncExprConversion;
 extern bool EnableExtendedIndexes;
 extern bool EnableDynamicCursors;
 extern bool EnableDistinctIndexPushdown;
@@ -346,14 +355,21 @@ extern bool EnableCollationWithNonUniqueOrderedIndexes;
 extern bool EnablePerPathMultiKeySortPushdown;
 extern bool EnableSupportFunctionIdPushdown;
 extern bool EnableGroupByMultiKeySortPushdown;
+extern bool EnableDistinctMultiKeySortPushdown;
+extern bool EnableSkipSortPushdownForNonPointEqualities;
 extern bool EnableCompositeReducedCorrelatedBoundsPlanning;
 extern bool EnableMergeSortForBitmapOr;
 extern bool EnableCrossIndexBitmapOrSortMerge;
 extern bool EnableCompositeReducedCorrelatedFirstOwnerFallback;
+extern bool EnableLookupJoinSelectivityFromStats;
+extern bool EnableFullScanCostAndSelectivity;
+extern bool EnableBtreeOrderByWithFilters;
+extern bool EnableCompositeRangeSelectivity;
 
 /* --------------------------------------------------------- */
 /* Forward declaration */
 /* --------------------------------------------------------- */
+
 static Expr * HandleSupportRequestCondition(SupportRequestIndexCondition *req);
 static Path * ReplaceFunctionOperatorsInPlanPath(PlannerInfo *root, RelOptInfo *rel,
 												 Path *path, PlanParentType parentType,
@@ -380,6 +396,8 @@ static bool IsMatchingPathForQueryOperator(RelOptInfo *rel, Path *path,
 										   MatchIndexPath matchIndexPath,
 										   void *matchContext);
 static RestrictInfo * MarkReducedCorrelatedIndexQualPlanned(RestrictInfo *indexQual);
+static bool HasMultipleRangeConditionsForOrderedIndexPath(IndexPath *indexPath);
+static RestrictInfo * GetNativeStatsRangeQual(RestrictInfo *rinfo, List **itemsToFree);
 static bool PruneReducedCorrelatedIndexQuals(IndexPath *indexPath, bytea *indexOptions,
 											 uint32_t multiKeyPathBitMask);
 static Expr * ProcessFullScanForOrderBy(SupportRequestIndexCondition *req, List *args);
@@ -538,7 +556,6 @@ static const ForceIndexSupportFuncs ForceIndexOperatorSupport[] =
 extern bool EnableVectorForceIndexPushdown;
 extern bool EnableGeonearForceIndexPushdown;
 extern bool ForceIndexOnlyScanIfAvailable;
-extern bool EnableOrderByIdOnCostFunction;
 extern int MaxMergeSortInValues;
 extern bool EnablePrimaryKeyCursorScan;
 
@@ -610,7 +627,15 @@ dollar_support(PG_FUNCTION_ARGS)
 	else if (IsA(supportRequest, SupportRequestSelectivity))
 	{
 		SupportRequestSelectivity *req = (SupportRequestSelectivity *) supportRequest;
-		if (EnablePlannerCostSelectivity(req->root, req->args))
+		if (req->funcid == BsonFullScanFunctionOid())
+		{
+			if (EnableFullScanCostAndSelectivity)
+			{
+				req->selectivity = 1.0;
+				responsePointer = (Pointer) req;
+			}
+		}
+		else if (EnablePlannerCostSelectivity(req->root, req->args))
 		{
 			const MongoIndexOperatorInfo *indexOperator =
 				GetMongoIndexOperatorInfoByPostgresFuncId(req->funcid);
@@ -656,6 +681,13 @@ dollar_support(PG_FUNCTION_ARGS)
 				req->startup = 0;
 				responsePointer = (Pointer) req;
 			}
+		}
+		else if (EnableFullScanCostAndSelectivity &&
+				 req->funcid == BsonFullScanFunctionOid())
+		{
+			req->per_tuple = 1e-9;
+			req->startup = 0;
+			responsePointer = (Pointer) req;
 		}
 	}
 
@@ -748,9 +780,23 @@ bson_dollar_lookup_filter_support(PG_FUNCTION_ARGS)
 		SupportRequestSelectivity *req = (SupportRequestSelectivity *) supportRequest;
 
 		/*
-		 * Consider low selectivity of lookup filter for better index estimates.
+		 * Default to a low selectivity for the lookup filter so that index
+		 * estimates stay reasonable when the join shape is not recognized.
 		 */
-		req->selectivity = LowSelectivity;
+		double selectivity = LowSelectivity;
+		if (req->funcid == BsonDollarLookupJoinFilterFunctionOid() &&
+			list_length(req->args) >= 3)
+		{
+			/* Estimate the join from the collected statistics where possible. */
+			selectivity = GetCustomStatisticsSelectivityForLookup(req->funcid,
+																  req->args,
+																  req->sjinfo,
+																  req->root,
+																  req->jointype,
+																  req->varRelid);
+		}
+
+		req->selectivity = selectivity;
 		PG_RETURN_POINTER(req);
 	}
 
@@ -3735,7 +3781,7 @@ documentdb_btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 {
 	bool convertedToIndexOnlyScan = false;
 
-	if (EnableOrderByIdOnCostFunction &&
+	if (ShouldEnableOrderByIdOnCostFunction(root, path->path.parent) &&
 		list_length(root->query_pathkeys) == 1)
 	{
 		ConsiderBtreeOrderByPushdown(root, path);
@@ -4281,7 +4327,8 @@ ConsiderIndexOrderByPushdownForId(PlannerInfo *root, RelOptInfo *rel, RangeTblEn
 	/* In this path, we only consider order by pushdown for the PK index - so we only support
 	 * having a single order by path key
 	 */
-	if (EnableOrderByIdOnCostFunction || list_length(root->query_pathkeys) != 1)
+	if (ShouldEnableOrderByIdOnCostFunction(root, rel) || list_length(
+			root->query_pathkeys) != 1)
 	{
 		return;
 	}
@@ -4385,14 +4432,68 @@ ConsiderIndexOrderByPushdownForId(PlannerInfo *root, RelOptInfo *rel, RangeTblEn
 				SortPathKeyStrategy(sortDetailsInput->sortPathKey) ==
 				BTGreaterStrategyNumber ?
 				BackwardScanDirection : ForwardScanDirection;
+			IndexPath *primaryKeyPath = NULL;
 
-			IndexClause *shard_key_clause =
-				BuildPointReadIndexClause(
-					context->plannerOrderByData.shardKeyEqualityExpr, 0);
-			List *indexClauses = list_make1(shard_key_clause);
-			IndexPath *primaryKeyPath = create_index_path(
-				root, primaryKeyIndex, indexClauses, NIL, NIL, NIL, scanDir, false, NULL,
-				1, false);
+			if (EnableBtreeOrderByWithFilters)
+			{
+				List *newIndexList = list_make1(primaryKeyIndex);
+
+				List *oldRelPaths = rel->pathlist;
+				List *oldIndexList = rel->indexlist;
+				rel->pathlist = NIL;
+				rel->indexlist = newIndexList;
+				create_index_paths(root, rel);
+				List *buildPaths = rel->pathlist;
+				rel->pathlist = oldRelPaths;
+				rel->indexlist = oldIndexList;
+
+				if (list_length(buildPaths) > 0)
+				{
+					Path *bestPath = linitial(buildPaths);
+					IndexPath *indexPath = NULL;
+					if (IsA(bestPath, IndexPath))
+					{
+						indexPath = (IndexPath *) bestPath;
+					}
+					else if (IsA(bestPath, BitmapHeapPath))
+					{
+						BitmapHeapPath *bitmapPath = (BitmapHeapPath *) bestPath;
+						if (IsA(bitmapPath->bitmapqual, IndexPath))
+						{
+							indexPath = (IndexPath *) bitmapPath->bitmapqual;
+						}
+					}
+
+					if (indexPath != NULL &&
+						indexPath->indexinfo == primaryKeyIndex)
+					{
+						if (list_length(indexPath->indexclauses) > 1)
+						{
+							bool hasNonIdFilters = false;
+							indexPath = TrimIndexRestrictInfoForBtreePath(root, indexPath,
+																		  &hasNonIdFilters);
+						}
+
+						primaryKeyPath = indexPath;
+					}
+				}
+			}
+
+			/* An unsharded collection's redundant shard-key qual may already
+			 * be removed, leaving no indexable filters to regenerate a path. */
+			if (primaryKeyPath == NULL)
+			{
+				IndexClause *shard_key_clause =
+					BuildPointReadIndexClause(
+						context->plannerOrderByData.shardKeyEqualityExpr, 0);
+				List *indexClauses = list_make1(shard_key_clause);
+				primaryKeyPath = create_index_path(
+					root, primaryKeyIndex, indexClauses, NIL, NIL, NIL, scanDir, false,
+					NULL,
+					1, false);
+			}
+
+			primaryKeyPath->indexscandir = scanDir;
 			primaryKeyPath->path.pathkeys = list_make1(sortDetailsInput->sortPathKey);
 			pathsToAdd = lappend(pathsToAdd, primaryKeyPath);
 		}
@@ -5062,10 +5163,11 @@ CreateMergeSortInPrefixMarkerClause(PlannerInfo *root, Expr *documentExpr)
  * Structural eligibility shared by the marking pass and the rewrite: the index
  * must be an ordered composite index with more than one path.
  *
- * A multi-key index is allowed: ConsiderMergeSortForInPrefix wraps the resulting
- * MergeAppend in a heap-TID de-dup CustomScan, so a document reachable through
- * more than one exploded $in branch (its array holds several matching values) is
- * returned once.
+ * A multi-key index is allowed: when one of the exploded $in columns is
+ * multi-key, ConsiderMergeSortForInPrefix wraps the resulting MergeAppend in a
+ * heap-TID de-dup CustomScan (see MergeSortInPrefixNeedsTidDedup), so a document
+ * reachable through more than one exploded $in branch (its array holds several
+ * matching values) is returned once.
  */
 static bool
 MergeSortInPrefixIndexEligible(IndexOptInfo *indexInfo)
@@ -5210,6 +5312,7 @@ TryBuildMergeSortInPrefixPlan(PlannerInfo *root, IndexOptInfo *indexInfo,
 
 			InPrefixOpInfo *info = palloc0(sizeof(InPrefixOpInfo));
 			info->indexcol = clause->indexcol;
+			info->compositeColumn = inColumn;
 			info->leftExpr = (Expr *) linitial(inExpr->args);
 			info->valueConsts = valueConsts;
 			info->inRinfo = clause->rinfo;
@@ -5241,6 +5344,13 @@ TryBuildMergeSortInPrefixPlan(PlannerInfo *root, IndexOptInfo *indexInfo,
 				(Node *) qual->clause, opClassOptions,
 				clauseEqualityPrefixes, clauseNonEqualityPrefixes,
 				&indexStrategyIgnore);
+
+			/*
+			 * Only a single-term equality pins the column for the per-value
+			 * child scans; an equality that spans several terms (such as $eq
+			 * against null or an array) would let each child stream more than
+			 * one run of the sort suffix.
+			 */
 			if (columnNumber >= 0 && clauseEqualityPrefixes[columnNumber])
 			{
 				plan->equalityPrefixes[columnNumber] = true;
@@ -5256,6 +5366,69 @@ TryBuildMergeSortInPrefixPlan(PlannerInfo *root, IndexOptInfo *indexInfo,
 	}
 
 	return true;
+}
+
+
+/*
+ * Whether a $in-prefix merge-sort needs a heap-TID de-duplication wrap above the
+ * MergeAppend, i.e. whether the same document can be reached through more than
+ * one child.
+ *
+ * Children differ only by the per-value point clause on the exploded $in
+ * columns, so a document reaches two children exactly when it holds two distinct
+ * $in values for one of those columns -- that is, when an *exploded* column is
+ * multi-key. Every child scans a distinct index term (GetInPrefixPointValues
+ * folds values that compare equal, and rejects collations that could fold two
+ * terms together), so no other column can split a document across children:
+ * multi-key on a sort column, on a plain-equality prefix column, or on a
+ * trailing $in carried as an in-scan is harmless. Duplicates *within* one child
+ * are already collapsed by the index AM's own per-scan heap-TID de-duplication.
+ *
+ * The per-path bitmask is only trustworthy when the index reports a per-path
+ * breakdown (a zero mask means the metadata carried no breakdown) and
+ * EnablePerPathMultiKeySortPushdown allows relying on it. Otherwise fall back to
+ * the whole-index answer, matching how GetIndexColumnMultiKeyStatus gates the
+ * same bitmask.
+ */
+static bool
+MergeSortInPrefixNeedsTidDedup(const MergeSortInPrefixPlan *plan,
+							   bool indexIsMultiKey, uint32_t multiKeyBitMask)
+{
+	if (!indexIsMultiKey)
+	{
+		return false;
+	}
+
+	if (!EnablePerPathMultiKeySortPushdown || multiKeyBitMask == 0)
+	{
+		return true;
+	}
+
+	ListCell *infoCell;
+	foreach(infoCell, plan->inInfos)
+	{
+		InPrefixOpInfo *info = (InPrefixOpInfo *) lfirst(infoCell);
+
+		/*
+		 * A column outside the bitmask width has no bit to consult, so it cannot
+		 * be checked safely and indicates an invalid internal plan.
+		 */
+		if (unlikely(info->compositeColumn < 0 ||
+					 info->compositeColumn >= INDEX_MAX_KEYS))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg(
+								"Invalid composite column %d for merge-sort TID de-duplication",
+								info->compositeColumn)));
+		}
+
+		if ((multiKeyBitMask & (UINT32_C(1) << info->compositeColumn)) != 0)
+		{
+			return true;
+		}
+	}
+
+	return false;
 }
 
 
@@ -5645,6 +5818,17 @@ ConsiderMergeSortForInPrefix(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 		bool indexIsMultiKey = false;
 
 		/*
+		 * Set when the merge can place the same document under more than one
+		 * child, so the MergeAppend needs a heap-TID de-dup wrap. For the $in
+		 * explosion this is narrower than indexIsMultiKey: only a multi-key
+		 * *exploded* column duplicates across children (see
+		 * MergeSortInPrefixNeedsTidDedup). The BitmapOr rewrite keeps the
+		 * whole-index answer, since its children are $or branches rather than
+		 * per-value point scans and the exploded-column argument does not apply.
+		 */
+		bool mergeNeedsTidDedup = false;
+
+		/*
 		 * Set when a BitmapOr -> MergeAppend rewrite has at least one pair of
 		 * branches that cannot be proven disjoint, so the MergeAppend may emit a
 		 * document once per matching branch and needs a heap-TID de-dup wrap.
@@ -5693,9 +5877,10 @@ ConsiderMergeSortForInPrefix(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 
 				/*
 				 * Structural eligibility (ordered composite index with more than one
-				 * path). A multi-key index is permitted: the MergeAppend built below is
-				 * wrapped in a heap-TID de-dup CustomScan so a document reachable through
-				 * more than one exploded $in branch is still returned once.
+				 * path). A multi-key index is permitted: if one of the exploded $in
+				 * columns is multi-key, the MergeAppend built below is wrapped in a
+				 * heap-TID de-dup CustomScan so a document reachable through more than
+				 * one exploded $in branch is still returned once.
 				 */
 				if (!MergeSortInPrefixIndexEligible(indexInfo))
 				{
@@ -5744,21 +5929,30 @@ ConsiderMergeSortForInPrefix(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 				}
 
 				/*
-				 * A multi-child MergeAppend over a multi-key index is wrapped in a
-				 * heap-TID de-dup CustomScan (see the wrap site further down). That
-				 * de-dup reads each row's heap ctid, which an index-only scan cannot
-				 * supply, so those children must be heap index scans. A single $in
-				 * combination is returned unwrapped and needs no ctid.
+				 * A multi-child MergeAppend that can surface the same document
+				 * through more than one child is wrapped in a heap-TID de-dup
+				 * CustomScan (see the wrap site further down). That de-dup reads
+				 * each row's heap ctid, which an index-only scan cannot supply, so
+				 * those children must be heap index scans. A single $in combination
+				 * is returned unwrapped and needs no ctid.
+				 *
+				 * Only a multi-key *exploded* column can duplicate across children,
+				 * so consult the per-path bitmask rather than the whole-index flag
+				 * and skip the wrap (and keep index-only scans available) when every
+				 * exploded column is proven scalar.
 				 */
 				indexIsMultiKey = CompositeIndexOptInfoIsMultiKey(indexInfo,
 																  &inPrefixMultiKeyBitMask);
+				mergeNeedsTidDedup = MergeSortInPrefixNeedsTidDedup(
+					&plan, indexIsMultiKey, inPrefixMultiKeyBitMask);
 
 				/*
 				 * Whether the children can be served as index-only scans is a query/index
 				 * level decision, identical for every child. Resolve it lazily on the
 				 * first child (-1 undetermined, 0 no, 1 yes) and reuse it for the rest.
 				 * Index-only is disallowed only when a de-dup wrap will read the heap
-				 * ctid, i.e. a multi-child MergeAppend on a multi-key index (see below).
+				 * ctid, i.e. a multi-child MergeAppend whose exploded $in columns
+				 * include a multi-key one (see below).
 				 */
 				int childrenIndexOnly = -1;
 				for (int combo = 0; combo < numChildren; combo++)
@@ -5794,11 +5988,12 @@ ConsiderMergeSortForInPrefix(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 						 * lossy = false claim is sound only because of that sibling point
 						 * clause: every row this child returns has the column fixed to one
 						 * $in value and therefore satisfies $in (the per-value union across
-						 * the MergeAppend supplies completeness). On a multi-key index a
-						 * document can still match more than one branch; the de-dup wrap on
-						 * the MergeAppend (see WrapPathWithTidDedup below) removes those
-						 * repeats. This must run after the point clause is appended and once
-						 * per $in column, since each child fixes all $in columns.
+						 * the MergeAppend supplies completeness). When an exploded $in
+						 * column is multi-key a document can still match more than one
+						 * branch; the de-dup wrap on the MergeAppend (see
+						 * WrapPathWithTidDedup below) removes those repeats. This must run
+						 * after the point clause is appended and once per $in column, since
+						 * each child fixes all $in columns.
 						 */
 						Assert(infoArray[i]->inRinfo != NULL);
 						IndexClause *coverClause = makeNode(IndexClause);
@@ -5860,12 +6055,20 @@ ConsiderMergeSortForInPrefix(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 
 					if (childrenIndexOnly < 0)
 					{
-						/* Multi-key indexes require heap children only when we will wrap the
-						 * multi-child MergeAppend in a TID de-dup node (which reads heap ctid). */
-						bool needsTidDedup = (indexIsMultiKey && numChildren > 1);
-
+						/*
+						 * Index-only eligibility is identical for every child because the
+						 * children differ only in their point values. Determine it once
+						 * from the first child and reuse it for the rest.
+						 *
+						 * When TID de-duplication is required, all children must remain
+						 * heap index scans because the de-dup node reads ctid. Per-path
+						 * multi-key tracking allows an index-only scan on a multi-key
+						 * index, so index-only eligibility does not imply that TID
+						 * de-duplication is unnecessary. Keep this condition in sync with
+						 * the de-dup wrap below.
+						 */
 						childrenIndexOnly =
-							(!needsTidDedup &&
+							(!(mergeNeedsTidDedup && numChildren > 1) &&
 							 MergeSortInPrefixChildrenSupportIndexOnly(root, rel,
 																	   childPath,
 																	   context)) ? 1 : 0;
@@ -5949,6 +6152,13 @@ ConsiderMergeSortForInPrefix(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 				indexIsMultiKey = CompositeIndexOptInfoIsMultiKey(indexInfo,
 																  &inPrefixMultiKeyBitMask);
 
+				/*
+				 * The BitmapOr children are $or branches, not per-value point scans
+				 * of an exploded $in, so the exploded-column argument does not apply
+				 * here: any multi-key column can put a document under more than one
+				 * branch. Keep the conservative whole-index answer.
+				 */
+				mergeNeedsTidDedup = indexIsMultiKey;
 
 				/*
 				 * Structural eligibility (ordered composite index with more than one
@@ -6351,17 +6561,18 @@ ConsiderMergeSortForInPrefix(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *
 			}
 
 			/*
-			 * A document can be reached through more than one exploded branch --
-			 * on a multi-key index (its array holds several matching values), or
-			 * on any index whose $or branches were not proven pairwise disjoint
-			 * above -- so the MergeAppend, which does not de-duplicate across
-			 * children, would return it once per branch. Wrap it in a heap-TID
-			 * de-dup CustomScan, which drops the repeats while preserving the
-			 * merge order. A single-key index whose branches are all provably
-			 * disjoint needs no de-dup: each document matches exactly one branch.
+			 * A document can be reached through more than one branch -- when a
+			 * multi-key column is one of the exploded $in columns (its array holds
+			 * several matching values), or on any index whose $or branches were not
+			 * proven pairwise disjoint above -- so the MergeAppend, which does not
+			 * de-duplicate across children, would return it once per branch. Wrap it
+			 * in a heap-TID de-dup CustomScan, which drops the repeats while
+			 * preserving the merge order. When every exploded column is scalar and
+			 * the branches are provably disjoint no de-dup is needed: each document
+			 * matches exactly one branch.
 			 */
 			Path *finalMergePath = (Path *) mergePath;
-			if (indexIsMultiKey || bitmapOrNeedsDedup)
+			if (mergeNeedsTidDedup || bitmapOrNeedsDedup)
 			{
 				finalMergePath = WrapPathWithTidDedup(finalMergePath);
 			}
@@ -6437,14 +6648,7 @@ ProcessOrderByStatements(PlannerInfo *root,
 		return;
 	}
 
-	if (isMultiKeyIndex && hasDistinct)
-	{
-		/* if it's multi-key and there's a distinct, we can't push down an order by. */
-		list_free(sortDetails);
-		return;
-	}
-
-	if (isMultiKeyIndex && hasGroupby)
+	if (isMultiKeyIndex && (hasDistinct || hasGroupby))
 	{
 		/*
 		 * A group-by can only stream off a multi-key composite ordered index
@@ -6460,9 +6664,15 @@ ProcessOrderByStatements(PlannerInfo *root,
 		 * so we can tell which individual columns are multi-key, and is gated
 		 * behind a dedicated, default-off flag. Without it we conservatively
 		 * refuse the whole pushdown.
+		 *
 		 */
+
+		/* Distinct also sets hasGroupby, so its flag must take precedence. */
+		bool pushdownEnabled = hasDistinct ? EnableDistinctMultiKeySortPushdown :
+							   (hasGroupby && EnableGroupByMultiKeySortPushdown);
+
 		bool rejectGroupByPushdown = true;
-		if (EnableGroupByMultiKeySortPushdown &&
+		if (pushdownEnabled &&
 			EnablePerPathMultiKeySortPushdown &&
 			hasPerPathMetadata)
 		{
@@ -6527,6 +6737,13 @@ ProcessOrderByStatements(PlannerInfo *root,
 	i = 0;
 	for (; i < minOrderByColumn; i++)
 	{
+		/*
+		 * Every column before the order-by must be pinned to a single index
+		 * term, otherwise the scan makes one ordered run per distinct prefix
+		 * term and the order-by column is only sorted within a run. Equality
+		 * alone is not enough: $eq against null or an array is an equality that
+		 * spans several terms. See IsSinglePointEqualityValue.
+		 */
 		if (!equalityPrefixes[i])
 		{
 			/* No orderby on the column */
@@ -6665,9 +6882,12 @@ ProcessOrderByStatements(PlannerInfo *root,
 		}
 		else if (!equalityPrefixes[i])
 		{
-			/* No order by on this column but we're less than the maxOrderBy.
-			 * If we don't have an equality prefix, this is no longer valid
-			 * for orderby
+			/*
+			 * For index (a, b, c) and sort (a, c), b must be pinned to one
+			 * index term. Equality to null also scans missing-field terms;
+			 * array equality can scan the array and its first element. For a
+			 * fixed a, c is ordered only within each b term, not across terms,
+			 * so retain only the already proven sort prefix.
 			 */
 			break;
 		}
@@ -6754,6 +6974,36 @@ PopulateQueryPathAndValueFromOpExpr(OpExpr *opExpr, const char **queryPathString
 }
 
 
+/*
+ * IsSinglePointEqualityValue returns true when an equality against queryValue
+ * is served by exactly one index term, so the column it applies to is pinned to
+ * a single value for the whole scan.
+ *
+ * Two value shapes are equalities that do not resolve to a single term:
+ *
+ *  - null, which is served by the range (MinKey, null] so that undefined terms
+ *    (a missing field or an empty array) match as well. See SetEqualityBound.
+ *  - an array, which is served by two alternative bounds: the array as a whole
+ *    and its first element. See SetArrayEqualityBound.
+ *
+ * A value that is not known at planning time cannot be shown to be a point
+ * either, so it is treated the same way.
+ */
+static bool
+IsMultiValueEqualityClause(const bson_value_t *optionalQueryValue)
+{
+	if (!EnableSkipSortPushdownForNonPointEqualities)
+	{
+		return false;
+	}
+
+	return optionalQueryValue != NULL &&
+		   (optionalQueryValue->value_type == BSON_TYPE_EOD ||
+			optionalQueryValue->value_type == BSON_TYPE_NULL ||
+			optionalQueryValue->value_type == BSON_TYPE_ARRAY);
+}
+
+
 static void
 IndexStrategyClassify(int32_t indexStrategy, bool *equalityPrefixes,
 					  bool *nonEqualityPrefixes,
@@ -6766,7 +7016,15 @@ IndexStrategyClassify(int32_t indexStrategy, bool *equalityPrefixes,
 	{
 		case BSON_INDEX_STRATEGY_DOLLAR_EQUAL:
 		{
-			*equalityPrefixes = true;
+			if (IsMultiValueEqualityClause(optionalQueryValue))
+			{
+				*nonEqualityPrefixes = true;
+			}
+			else
+			{
+				*equalityPrefixes = true;
+			}
+
 			break;
 		}
 
@@ -6816,7 +7074,14 @@ IndexStrategyClassify(int32_t indexStrategy, bool *equalityPrefixes,
 			}
 			else if (isPartialFilterExpr && opNo == BsonEqualMatchRuntimeOperatorId())
 			{
-				*equalityPrefixes = true;
+				if (IsMultiValueEqualityClause(optionalQueryValue))
+				{
+					*nonEqualityPrefixes = true;
+				}
+				else
+				{
+					*equalityPrefixes = true;
+				}
 			}
 			else
 			{
@@ -7767,12 +8032,41 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
 
 	if (indexPath->indexinfo->indpred != NIL)
 	{
+		bool partialFilterEqualityPrefixes[INDEX_MAX_KEYS] = { 0 };
 		if (ProcessCompositePartialFilter(
 				indexPath->indexinfo->indpred,
 				indexPath->indexinfo->opclassoptions[0],
-				equalityPrefixes, nonEqualityPrefixes, anySpecifiedPrefixes))
+				partialFilterEqualityPrefixes, nonEqualityPrefixes,
+				anySpecifiedPrefixes))
 		{
 			firstFilterColumnFound = true;
+		}
+
+		/* Partial filter equality prefixes are special since they
+		 * can only count if the path itself is not multi-key. This is because
+		 * the PFE currently is applied at the index level, but the AM term generation
+		 * does not obey the PFE and generates the other array terms that do not match
+		 * the partial filter expression.
+		 */
+		uint32_t multiKeyBitMask = indexMetadata.multiKeyPathBitMask;
+		for (int i = 0; i < INDEX_MAX_KEYS; i++)
+		{
+			if (!EnableSkipSortPushdownForNonPointEqualities)
+			{
+				equalityPrefixes[i] |= partialFilterEqualityPrefixes[i];
+			}
+			else if ((!isMultiKeyIndex) || (hasPerPathMetadata &&
+											(multiKeyBitMask & (UINT32_C(1) << i)) == 0))
+			{
+				equalityPrefixes[i] |= partialFilterEqualityPrefixes[i];
+			}
+			else if (partialFilterEqualityPrefixes[i])
+			{
+				/* Don't count this as unspecified - technically this now counts as
+				 * inequality - this is to ensure we don't now push $sort on this column.
+				 */
+				nonEqualityPrefixes[i] = true;
+			}
 		}
 	}
 
@@ -7893,13 +8187,16 @@ TraverseIndexPathForCompositeIndex(struct IndexPath *indexPath, struct PlannerIn
  * for a query that has EQ(A), EQ(C) -> the boundary is "EQ(A)"
  */
 List *
-ExtractBoundaryQualsForOrderedIndexPath(IndexPath *indexPath, int *num_sa_scans)
+ExtractBoundaryQualsForOrderedIndexPath(IndexPath *indexPath, int *num_sa_scans,
+										List **itemsToFree)
 {
 	List *validRestrictInfos[INDEX_MAX_KEYS] = { 0 };
 	bool equalityPrefixesGlobal[INDEX_MAX_KEYS] = { 0 };
 	int32_t numSaopScans[INDEX_MAX_KEYS] = { 0 };
 	int maxGlobalColumnNumber = -1;
 	*num_sa_scans = 1;
+	bool rewriteRanges = EnableCompositeRangeSelectivity &&
+						 HasMultipleRangeConditionsForOrderedIndexPath(indexPath);
 
 	ListCell *cell;
 	foreach(cell, indexPath->indexclauses)
@@ -7919,17 +8216,25 @@ ExtractBoundaryQualsForOrderedIndexPath(IndexPath *indexPath, int *num_sa_scans)
 				continue;
 			}
 
-			Expr *clauseArg = lsecond(((OpExpr *) clause)->args);
-			if (!IsA(clauseArg, Const))
+			OpExpr *opExpr = (OpExpr *) clause;
+			Expr *clauseArg = lsecond(opExpr->args);
+			if (IsA(clauseArg, Const))
 			{
 				/* We only support const args for now */
+				Const *clauseConst = (Const *) clauseArg;
+				if (clauseConst->constisnull)
+				{
+					/* We don't support null const args for now */
+					continue;
+				}
+			}
+			else if (IsA(clauseArg, FuncExpr) &&
+					 !EnableLookupJoinSelectivityFromStats)
+			{
 				continue;
 			}
-
-			Const *clauseConst = (Const *) clauseArg;
-			if (clauseConst->constisnull)
+			else if (!IsA(clauseArg, FuncExpr))
 			{
-				/* We don't support null const args for now */
 				continue;
 			}
 
@@ -7975,7 +8280,16 @@ ExtractBoundaryQualsForOrderedIndexPath(IndexPath *indexPath, int *num_sa_scans)
 		}
 
 		/* This path is valid for consideration with boundary clauses */
-		finalBoundaryClauses = list_concat(finalBoundaryClauses, validRestrictInfos[i]);
+		foreach(cell, validRestrictInfos[i])
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, cell);
+			if (rewriteRanges)
+			{
+				rinfo = GetNativeStatsRangeQual(rinfo, itemsToFree);
+			}
+
+			finalBoundaryClauses = lappend(finalBoundaryClauses, rinfo);
+		}
 
 		*num_sa_scans += numSaopScans[i];
 
@@ -8002,9 +8316,255 @@ ExtractBoundaryQualsForOrderedIndexPath(IndexPath *indexPath, int *num_sa_scans)
 }
 
 
+/*
+ * Builds temporary index clauses that use the native statistics operators for
+ * range bounds. The returned list aliases the original clauses unless at
+ * least one qual is replaced. Every allocation retained by the returned clauses
+ * is added to itemsToFree for shallow deallocation with list_free_deep.
+ */
+List *
+GetModifiedClauseListForOrderedIndexPath(IndexPath *indexPath, List **itemsToFree)
+{
+	ListCell *cell;
+	bool hasModifiedClauses = false;
+	List *modifiedClauses = NIL;
+	bool equalityPrefixes[INDEX_MAX_KEYS] = { 0 };
+	bool nonEqualityPrefixes[INDEX_MAX_KEYS] = { 0 };
+	if (!HasMultipleRangeConditionsForOrderedIndexPath(indexPath))
+	{
+		return indexPath->indexclauses;
+	}
+
+	foreach(cell, indexPath->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(cell);
+
+		ListCell *lc2;
+		List *modifiedIndexQuals = NIL;
+		bool qualsModified = false;
+		foreach(lc2, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+			if (!IsA(rinfo->clause, OpExpr))
+			{
+				modifiedIndexQuals = lappend(modifiedIndexQuals, rinfo);
+				continue;
+			}
+
+			OpExpr *opExpr = (OpExpr *) rinfo->clause;
+			int32_t indexStrategy = 0;
+			int columnNumber = ProcessSingleCompositeFilter(
+				(Node *) opExpr, indexPath->indexinfo->opclassoptions[iclause->indexcol],
+				equalityPrefixes, nonEqualityPrefixes, &indexStrategy);
+			if (columnNumber < 0)
+			{
+				modifiedIndexQuals = lappend(modifiedIndexQuals, rinfo);
+				continue;
+			}
+
+			RestrictInfo *modifiedQual = GetNativeStatsRangeQual(rinfo, itemsToFree);
+			modifiedIndexQuals = lappend(modifiedIndexQuals, modifiedQual);
+			qualsModified |= modifiedQual != rinfo;
+		}
+
+		if (qualsModified)
+		{
+			hasModifiedClauses = true;
+			IndexClause *clauseCopy = palloc(sizeof(IndexClause));
+			*itemsToFree = lappend(*itemsToFree, modifiedIndexQuals);
+			*itemsToFree = lappend(*itemsToFree, clauseCopy);
+			memcpy(clauseCopy, iclause, sizeof(IndexClause));
+			clauseCopy->indexquals = modifiedIndexQuals;
+			modifiedClauses = lappend(modifiedClauses, clauseCopy);
+		}
+		else
+		{
+			list_free(modifiedIndexQuals);
+			modifiedClauses = lappend(modifiedClauses, iclause);
+		}
+	}
+
+	if (hasModifiedClauses)
+	{
+		*itemsToFree = lappend(*itemsToFree, modifiedClauses);
+		return modifiedClauses;
+	}
+
+	list_free(modifiedClauses);
+	return indexPath->indexclauses;
+}
+
+
 /* --------------------------------------------------------- */
 /* Private functions */
 /* --------------------------------------------------------- */
+
+static bool
+HasMultipleRangeConditionsForOrderedIndexPath(IndexPath *indexPath)
+{
+	bool equalityPrefixes[INDEX_MAX_KEYS] = { 0 };
+	bool nonEqualityPrefixes[INDEX_MAX_KEYS] = { 0 };
+	int numConds[INDEX_MAX_KEYS] = { 0 };
+	ListCell *cell;
+	foreach(cell, indexPath->indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, cell);
+		ListCell *qualCell;
+		foreach(qualCell, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, qualCell);
+			int32_t indexStrategy = 0;
+			int columnNumber = ProcessSingleCompositeFilter(
+				(Node *) rinfo->clause,
+				indexPath->indexinfo->opclassoptions[iclause->indexcol],
+				equalityPrefixes, nonEqualityPrefixes, &indexStrategy);
+			if (columnNumber < 0)
+			{
+				continue;
+			}
+
+			switch (indexStrategy)
+			{
+				case BSON_INDEX_STRATEGY_DOLLAR_GREATER:
+				case BSON_INDEX_STRATEGY_DOLLAR_GREATER_EQUAL:
+				case BSON_INDEX_STRATEGY_DOLLAR_LESS:
+				case BSON_INDEX_STRATEGY_DOLLAR_LESS_EQUAL:
+				{
+					if (++numConds[columnNumber] > 1)
+					{
+						return true;
+					}
+
+					break;
+				}
+
+				default:
+				{
+					break;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+
+static RestrictInfo *
+GetNativeStatsRangeQual(RestrictInfo *rinfo, List **itemsToFree)
+{
+	if (!IsA(rinfo->clause, OpExpr))
+	{
+		return rinfo;
+	}
+
+	OpExpr *opExpr = (OpExpr *) rinfo->clause;
+	const MongoIndexOperatorInfo *indexOperator =
+		GetMongoIndexOperatorByPostgresOperatorId(opExpr->opno);
+	if (indexOperator == NULL || list_length(opExpr->args) != 2)
+	{
+		return rinfo;
+	}
+
+	Expr *firstArg = linitial(opExpr->args);
+	Expr *secondArg = lsecond(opExpr->args);
+	if (!IsA(firstArg, Var) || !IsA(secondArg, Const) ||
+		((Const *) secondArg)->constisnull)
+	{
+		return rinfo;
+	}
+
+	Const *argConst = (Const *) secondArg;
+	pgbson *argBson = DatumGetPgBson(argConst->constvalue);
+	pgbsonelement dollarElement = { 0 };
+	PgbsonToSinglePgbsonElementWithCollation(argBson, &dollarElement);
+
+	bool equalityPrefix = false;
+	bool nonEqualityPrefix = false;
+	int8_t orderScanDirection = 0;
+	int32_t indexStrategy = 0;
+	bool isPartialFilterExpr = true;
+	IndexStrategyClassify(indexOperator->indexStrategy, &equalityPrefix,
+						  &nonEqualityPrefix, opExpr->opno, isPartialFilterExpr,
+						  &dollarElement.bsonValue, &orderScanDirection, &indexStrategy);
+
+	int btreeStrategy = 0;
+	switch (indexStrategy)
+	{
+		case BSON_INDEX_STRATEGY_DOLLAR_GREATER:
+		{
+			btreeStrategy = BTGreaterStrategyNumber;
+			break;
+		}
+
+		case BSON_INDEX_STRATEGY_DOLLAR_GREATER_EQUAL:
+		{
+			btreeStrategy = BTGreaterEqualStrategyNumber;
+			break;
+		}
+
+		case BSON_INDEX_STRATEGY_DOLLAR_LESS:
+		{
+			btreeStrategy = BTLessStrategyNumber;
+			break;
+		}
+
+		case BSON_INDEX_STRATEGY_DOLLAR_LESS_EQUAL:
+		{
+			btreeStrategy = BTLessEqualStrategyNumber;
+			break;
+		}
+
+		default:
+		{
+			return rinfo;
+		}
+	}
+
+	Oid opNo = NativeStatsBtreeOperatorForStrategy(btreeStrategy);
+	if (!OidIsValid(opNo))
+	{
+		return rinfo;
+	}
+
+	/* Preserve the existence semantics of >= MinKey. */
+	if (btreeStrategy == BTGreaterEqualStrategyNumber &&
+		dollarElement.bsonValue.value_type == BSON_TYPE_MINKEY)
+	{
+		return rinfo;
+	}
+
+	Const *pathValue = MakeTextConst(dollarElement.path, dollarElement.pathLength);
+	*itemsToFree = lappend(*itemsToFree, DatumGetPointer(pathValue->constvalue));
+	*itemsToFree = lappend(*itemsToFree, pathValue);
+	List *pathArgs = list_make2(firstArg, pathValue);
+	*itemsToFree = lappend(*itemsToFree, pathArgs);
+	Expr *projectedValue = (Expr *) makeFuncExpr(
+		BsonStatsProjectFuncOid(), BsonTypeId(),
+		pathArgs, InvalidOid,
+		DEFAULT_COLLATION_OID, COERCE_EXPLICIT_CALL);
+	*itemsToFree = lappend(*itemsToFree, projectedValue);
+	pgbson *queryDocument = BsonValueToDocumentPgbson(&dollarElement.bsonValue);
+	*itemsToFree = lappend(*itemsToFree, queryDocument);
+	Const *queryValue = MakeBsonConst(queryDocument);
+	*itemsToFree = lappend(*itemsToFree, queryValue);
+	queryValue->consttype = BsonQueryTypeId();
+	Expr *modifiedOpExpr = make_opclause(opNo, BOOLOID, false,
+										 projectedValue, (Expr *) queryValue,
+										 opExpr->opcollid, opExpr->inputcollid);
+	*itemsToFree = lappend(*itemsToFree, ((OpExpr *) modifiedOpExpr)->args);
+	*itemsToFree = lappend(*itemsToFree, modifiedOpExpr);
+	RestrictInfo *rinfoCopy = makeNode(RestrictInfo);
+	*itemsToFree = lappend(*itemsToFree, rinfoCopy);
+	memcpy(rinfoCopy, rinfo, sizeof(RestrictInfo));
+	rinfoCopy->clause = modifiedOpExpr;
+
+	/* The cached selectivity belongs to the original clause. */
+	rinfoCopy->norm_selec = -1;
+	rinfoCopy->outer_selec = -1;
+	return rinfoCopy;
+}
+
 
 /*
  * Inspects an input SupportRequestIndexCondition and associated FuncExpr
@@ -8701,8 +9261,7 @@ TryRewriteObjectIndexRestrictionInfoFuncExpr(FuncExpr *funcExpr)
 													NULL);
 		}
 	}
-	else if (EnableObjectIdFuncExprConversion &&
-			 funcExpr->funcid == BsonRegexObjectIdMatchFunctionId())
+	else if (funcExpr->funcid == BsonRegexObjectIdMatchFunctionId())
 	{
 		const MongoIndexOperatorInfo *operator =
 			GetMongoIndexOperatorInfoByPostgresFuncId(

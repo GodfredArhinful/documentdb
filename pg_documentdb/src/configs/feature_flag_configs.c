@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/configs/feature_flag_configs.c
  *
@@ -24,6 +25,11 @@
 bool EnableSchemaValidation =
 	DEFAULT_ENABLE_SCHEMA_VALIDATION;
 
+/* Added on v1.2, pending stabilization, enable on v1.3 */
+#define DEFAULT_ENABLE_COLLATION_WITH_SCHEMA_VALIDATION false
+bool EnableCollationWithSchemaValidation =
+	DEFAULT_ENABLE_COLLATION_WITH_SCHEMA_VALIDATION;
+
 /* Added in v0.108, enabled in v0.114, remove after v1.3 */
 #define DEFAULT_ENABLE_BYPASSDOCUMENTVALIDATION true
 bool EnableBypassDocumentValidation =
@@ -32,6 +38,37 @@ bool EnableBypassDocumentValidation =
 /* Added on v0.117, enabled in v0.117, remove after v1.2 */
 #define DEFAULT_ENABLE_NULL_COLLECTION_VALIDATION true
 bool EnableNullCollectionValidation = DEFAULT_ENABLE_NULL_COLLECTION_VALIDATION;
+
+/*
+ * SECTION: Command validation flags
+ */
+
+/* Added in v1.2, enabled in v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_BSON_TYPE_ARGUMENT_VALIDATION true
+bool EnableBsonTypeArgumentValidation =
+	DEFAULT_ENABLE_BSON_TYPE_ARGUMENT_VALIDATION;
+
+/*
+ * The following flags gate validation and command behavior that is enforced in
+ * the gateways. They are consumed by the gateways through pg_settings; the
+ * backend only registers them so they can be toggled as kill-switches.
+ */
+
+/* Added in v1.2, enabled in v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_READ_CONCERN_VALIDATION true
+bool EnableReadConcernValidation = DEFAULT_ENABLE_READ_CONCERN_VALIDATION;
+
+/* Added in v1.2, enabled in v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_SESSION_ARGUMENT_VALIDATION true
+bool EnableSessionArgumentValidation = DEFAULT_ENABLE_SESSION_ARGUMENT_VALIDATION;
+
+/* Added in v1.2, enabled in v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_GETMORE_ARGUMENT_VALIDATION true
+bool EnableGetMoreArgumentValidation = DEFAULT_ENABLE_GETMORE_ARGUMENT_VALIDATION;
+
+/* Added in v1.2, enabled in v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_SERVER_STATUS_COMMAND true
+bool EnableServerStatusCommand = DEFAULT_ENABLE_SERVER_STATUS_COMMAND;
 
 /*
  * SECTION: Text search flags
@@ -54,15 +91,15 @@ bool EnableSkipUseQueryTextData = DEFAULT_ENABLE_SKIP_USE_QUERY_TEXT_DATA;
 #define DEFAULT_ENABLE_USERNAME_PASSWORD_CONSTRAINTS true
 bool EnableUsernamePasswordConstraints = DEFAULT_ENABLE_USERNAME_PASSWORD_CONSTRAINTS;
 
-/* Added in v0.108, enabled in v0.108, Unknown stabilization time */
+/* Added in v0.108, enabled in v0.108, remove after v1.6 */
 #define DEFAULT_ENABLE_USERS_INFO_PRIVILEGES true
 bool EnableUsersInfoPrivileges = DEFAULT_ENABLE_USERS_INFO_PRIVILEGES;
 
-/* Added in v0.108, Pending stabilization */
+/* Added in v0.108, pending stabilization, enable in v1.5 */
 #define DEFAULT_ENABLE_ROLE_CRUD false
 bool EnableRoleCrud = DEFAULT_ENABLE_ROLE_CRUD;
 
-/* Added in v0.109, Pending stabilization */
+/* Added in v0.109, pending stabilization, enable in v1.3 */
 #define DEFAULT_ENABLE_USERS_ADMIN_DB_CHECK false
 bool EnableUsersAdminDBCheck = DEFAULT_ENABLE_USERS_ADMIN_DB_CHECK;
 
@@ -137,6 +174,15 @@ bool EnableCompositeIndexPlanner = DEFAULT_ENABLE_COMPOSITE_INDEX_PLANNER;
 #define DEFAULT_ENABLE_ORDER_BY_ID_ON_COST false
 bool EnableOrderByIdOnCostFunction = DEFAULT_ENABLE_ORDER_BY_ID_ON_COST;
 
+/* Added on v1.3, enabled on v1.3, remove after v1.5 */
+#define DEFAULT_ENABLE_ORDER_BY_ID_ON_COST_WITH_STATS true
+bool EnableOrderByIdOnCostFunctionWithStats =
+	DEFAULT_ENABLE_ORDER_BY_ID_ON_COST_WITH_STATS;
+
+/* Added on v1.3, enabled on v1.3, remove after v1.5 */
+#define DEFAULT_ENABLE_BTREE_ORDER_BY_WITH_FILTERS true
+bool EnableBtreeOrderByWithFilters = DEFAULT_ENABLE_BTREE_ORDER_BY_WITH_FILTERS;
+
 /* Note: this is a long term feature flag since we need to validate compatiblity
  * in mixed mode for older indexes - once this is
  * enabled by default - please move this to testing_configs.
@@ -149,6 +195,26 @@ bool EnableValueOnlyIndexTerms = DEFAULT_ENABLE_VALUE_ONLY_INDEX_TERMS;
 /* Added in v0.114, Pending stabilization, enable in v1.2 */
 #define DEFAULT_ENABLE_FAILURE_ON_PARALLEL_INDEX_ARRAYS false
 bool EnableFailureOnParallelIndexArrays = DEFAULT_ENABLE_FAILURE_ON_PARALLEL_INDEX_ARRAYS;
+
+/* Added in v1.2, Pending stabilization, enable in v1.4 */
+#define DEFAULT_ENABLE_COMPOSITE_UNIQUE_OPTIONAL_KEY false
+bool EnableCompositeUniqueOptionalKey =
+	DEFAULT_ENABLE_COMPOSITE_UNIQUE_OPTIONAL_KEY;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_UNIQUE_NULL_MISSING_EQUIVALENCE true
+bool EnableUniqueNullMissingEquivalence =
+	DEFAULT_ENABLE_UNIQUE_NULL_MISSING_EQUIVALENCE;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.6 */
+#define DEFAULT_ENABLE_UNIQUE_NULL_MISSING_SEMANTICS true
+bool EnableUniqueNullMissingSemantics =
+	DEFAULT_ENABLE_UNIQUE_NULL_MISSING_SEMANTICS;
+
+/* Added in v1.2, Pending stabilization, enable in v1.4 */
+#define DEFAULT_ENABLE_COLLATED_UNIQUE_INDEXES false
+bool EnableCollatedUniqueIndexes =
+	DEFAULT_ENABLE_COLLATED_UNIQUE_INDEXES;
 
 /* Added on v0.116, enabled on v0.116, remove after v1.1 */
 #define DEFAULT_ENABLE_FAILURE_ON_PARALLEL_INDEX_ARRAYS_FOR_METADATA_TRACKING true
@@ -211,19 +277,35 @@ bool EnablePerPathMultiKeySortPushdown =
 bool EnableGroupByMultiKeySortPushdown =
 	DEFAULT_ENABLE_GROUP_BY_MULTI_KEY_SORT_PUSHDOWN;
 
+/* Added in v0.117, pending stabilization, enable in v1.3 */
+#define DEFAULT_ENABLE_DISTINCT_MULTI_KEY_SORT_PUSHDOWN false
+bool EnableDistinctMultiKeySortPushdown =
+	DEFAULT_ENABLE_DISTINCT_MULTI_KEY_SORT_PUSHDOWN;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_SKIP_SORT_PUSHDOWN_FOR_NON_POINT_EQUALITIES true
+bool EnableSkipSortPushdownForNonPointEqualities =
+	DEFAULT_ENABLE_SKIP_SORT_PUSHDOWN_FOR_NON_POINT_EQUALITIES;
+
 /* Added in v0.115, enabled in v0.115, remove after v1.0 */
 #define DEFAULT_ENABLE_INDEX_CORRELATION_FROM_STATISTICS true
 bool EnableIndexCorrelationFromStatistics =
 	DEFAULT_ENABLE_INDEX_CORRELATION_FROM_STATISTICS;
 
+/* Added in v1.1, enabled in v1.2, remove after v1.5 */
+#define DEFAULT_ENABLE_COMPOSITE_RANGE_SELECTIVITY true
+bool EnableCompositeRangeSelectivity =
+	DEFAULT_ENABLE_COMPOSITE_RANGE_SELECTIVITY;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.5 */
+#define DEFAULT_ENABLE_ELEM_MATCH_SELECTIVITY_FROM_STATS true
+bool EnableElemMatchSelectivityFromStats =
+	DEFAULT_ENABLE_ELEM_MATCH_SELECTIVITY_FROM_STATS;
+
 /* Added in v0.111, enabled in v0.115, remove after v1.0 */
 #define DEFAULT_ENABLE_PER_COLLECTION_PLANNER_STATISTICS true
 bool EnablePerCollectionPlannerStatistics =
 	DEFAULT_ENABLE_PER_COLLECTION_PLANNER_STATISTICS;
-
-/* Added in v0.116, enabled in v0.116, remove after v1.1 */
-#define DEFAULT_SKIP_LEGACY_ID_INDEX_STATS_CHECK true
-bool SkipLegacyIdIndexStatsCheck = DEFAULT_SKIP_LEGACY_ID_INDEX_STATS_CHECK;
 
 /* Added in v0.113, Pending stabilization, enable in v1.2 */
 #define DEFAULT_ENABLE_PLANNER_STATISTICS_NEW_COLLECTIONS false
@@ -261,6 +343,11 @@ bool EnableScalarAggregateAccumulatorPathCollection =
 #define DEFAULT_ENABLE_SKIP_SETTING_ORDER_SCAN_DIRECTION_FOR_FULL_SCAN_EXPR true
 bool EnableSkipSettingOrderScanDirectionForFullScanExpr =
 	DEFAULT_ENABLE_SKIP_SETTING_ORDER_SCAN_DIRECTION_FOR_FULL_SCAN_EXPR;
+
+/* Added on v1.1, enabled on v1.1, remove after v1.3 */
+#define DEFAULT_ENABLE_FULL_SCAN_COST_AND_SELECTIVITY true
+bool EnableFullScanCostAndSelectivity =
+	DEFAULT_ENABLE_FULL_SCAN_COST_AND_SELECTIVITY;
 
 /* Added in v0.112, enabled in v0.112, remove after v1.3 */
 #define DEFAULT_ENABLE_PARTIAL_MATCH_HAS_RECHECK true
@@ -305,7 +392,7 @@ bool EnableParallelSafeWithExprAccumulators =
 #define DEFAULT_ENABLE_MIN_MAX_SKIP_NULL_VALUES true
 bool EnableMinMaxSkipNullValues = DEFAULT_ENABLE_MIN_MAX_SKIP_NULL_VALUES;
 
-/* Added in v0.113, pending stabilization, enable in v1.1 */
+/* Added in v0.113, pending stabilization, enable in v1.5 */
 #define DEFAULT_ENABLE_DYNAMIC_CURSORS false
 bool EnableDynamicCursors = DEFAULT_ENABLE_DYNAMIC_CURSORS;
 
@@ -314,23 +401,24 @@ bool EnableDynamicCursors = DEFAULT_ENABLE_DYNAMIC_CURSORS;
 bool EnableDynamicCursorWithSkipLimit =
 	DEFAULT_ENABLE_DYNAMIC_CURSOR_WITH_SKIPLIMIT;
 
-/* Added in v0.115, enabled in v0.115, remove after v0.117 */
-#define DEFAULT_ENABLE_DYNAMIC_PERSISTENT_CURSORS_WITH_STATS true
-bool EnableDynamicPersistentCursorsWithStats =
-	DEFAULT_ENABLE_DYNAMIC_PERSISTENT_CURSORS_WITH_STATS;
-
-/* Added in v0.115, enabled in v0.115, remove after v0.117 */
-#define DEFAULT_ENABLE_DYNAMIC_CURSOR_FAST_STARTUP_SCAN true
-bool EnableDynamicCursorFastStartupScan = DEFAULT_ENABLE_DYNAMIC_CURSOR_FAST_STARTUP_SCAN;
-
 /* Added in v1.0, pending stabilization, enable in v1.3 */
 #define DEFAULT_ENABLE_DYNAMIC_CURSOR_EARLY_INDEX_LOCK_RELEASE false
 bool EnableDynamicCursorEarlyIndexLockRelease =
 	DEFAULT_ENABLE_DYNAMIC_CURSOR_EARLY_INDEX_LOCK_RELEASE;
 
-/* Added in v0.115, enabled in v0.115, remove after v0.117 */
+/* Added in v0.115, enabled in v0.115, remove after v1.4 */
 #define DEFAULT_ENABLE_DYNAMIC_CURSOR_PARALLEL_PLANS true
 bool EnableDynamicCursorParallelPlans = DEFAULT_ENABLE_DYNAMIC_CURSOR_PARALLEL_PLANS;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.8 */
+#define DEFAULT_ENABLE_NON_DYNAMIC_CURSOR_PARALLEL_PLANS true
+bool EnableNonDynamicCursorParallelPlans =
+	DEFAULT_ENABLE_NON_DYNAMIC_CURSOR_PARALLEL_PLANS;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.8 */
+#define DEFAULT_ENABLE_SKIP_PARALLEL_PLANS_WITHOUT_STATS true
+bool EnableSkipParallelPlansWithoutStats =
+	DEFAULT_ENABLE_SKIP_PARALLEL_PLANS_WITHOUT_STATS;
 
 /* Tracks deduplication state for ordered multikey index scans and carries it
  * forward in the continuation so each document is returned at most once across
@@ -340,18 +428,9 @@ bool EnableDynamicCursorParallelPlans = DEFAULT_ENABLE_DYNAMIC_CURSOR_PARALLEL_P
 #define DEFAULT_ENABLE_DYNAMIC_CURSOR_DEDUP_TRACKING true
 bool EnableDynamicCursorDedupTracking = DEFAULT_ENABLE_DYNAMIC_CURSOR_DEDUP_TRACKING;
 
-/* Added in v0.115, enabled in v0.115, remove after v0.117 */
-#define DEFAULT_ENABLE_SINGLE_RESULT_QUERY_PARALLEL_PLANS true
-bool EnableSingleResultQueryParallelPlans =
-	DEFAULT_ENABLE_SINGLE_RESULT_QUERY_PARALLEL_PLANS;
-
 /* Added in v0.116, enabled in v0.116, remove after v1.0 */
 #define DEFAULT_ENABLE_GROUP_BY_DYNAMIC_STREAMING true
 bool EnableGroupByDynamicStreaming = DEFAULT_ENABLE_GROUP_BY_DYNAMIC_STREAMING;
-
-/* Added in v0.115, enabled in v0.115, remove after v0.117 */
-#define DEFAULT_ENABLE_PG_PRNG_CURSOR_ID true
-bool EnablePGPrngCursorId = DEFAULT_ENABLE_PG_PRNG_CURSOR_ID;
 
 /* Added in v0.114, enabled in v0.114, remove after v1.2 */
 #define DEFAULT_ENABLE_INDEX_PATH_KEY_SUMMARIZATION true
@@ -378,15 +457,24 @@ bool EnableDistinctScanForOrderedGroupFirst =
 #define DEFAULT_ENABLE_SUPPORT_FUNCTION_ID_PUSHDOWN false
 bool EnableSupportFunctionIdPushdown = DEFAULT_ENABLE_SUPPORT_FUNCTION_ID_PUSHDOWN;
 
+/* Added on v1.2, enabled on v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_SUPPORT_OBJECT_ID_FUNCTION_PFE_PUSHDOWN true
+bool EnableSupportObjectIdFunctionPfePushdown =
+	DEFAULT_ENABLE_SUPPORT_OBJECT_ID_FUNCTION_PFE_PUSHDOWN;
+
 /*
  * SECTION: Aggregation & Query feature flags
  */
+
+/* Added on v1.2, enabled on v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_DATE_TRUNC_DAY_WITH_PG_BIN true
+bool EnableDateTruncDayWithPgBin = DEFAULT_ENABLE_DATE_TRUNC_DAY_WITH_PG_BIN;
 
 /* Added on v1.1, enabled on v1.1, remove after v1.3 */
 #define DEFAULT_ENABLE_ADMIN_DATABASE_QUERIES true
 bool EnableAdminDatabaseQueries = DEFAULT_ENABLE_ADMIN_DATABASE_QUERIES;
 
-/* Added in v0.109, enabled in v0.115, remove after v0.117 */
+/* Added in v0.109, enabled in v0.115, remove after v1.4 */
 #define DEFAULT_ENABLE_PRIMARY_KEY_CURSOR_SCAN true
 bool EnablePrimaryKeyCursorScan = DEFAULT_ENABLE_PRIMARY_KEY_CURSOR_SCAN;
 
@@ -394,7 +482,7 @@ bool EnablePrimaryKeyCursorScan = DEFAULT_ENABLE_PRIMARY_KEY_CURSOR_SCAN;
 #define DEFAULT_USE_FILE_BASED_PERSISTED_CURSORS false
 bool UseFileBasedPersistedCursors = DEFAULT_USE_FILE_BASED_PERSISTED_CURSORS;
 
-/* Added in v0.114, Enabled in v0.114, remove after v0.117 */
+/* Added in v0.114, Enabled in v0.114, remove after v1.4 */
 #define DEFAULT_CLEANUP_CURSOR_FILES true
 bool CleanupCursorFiles = DEFAULT_CLEANUP_CURSOR_FILES;
 
@@ -410,14 +498,6 @@ bool EnableRumCursorDynamicIndexScans = DEFAULT_ENABLE_RUM_CURSOR_DYNAMIC_INDEX_
 #define DEFAULT_ENABLE_RUM_DYNAMIC_INDEX_SCANS_SKIP_TO_TID true
 bool EnableRumDynamicIndexScansSkipToTid =
 	DEFAULT_ENABLE_RUM_DYNAMIC_INDEX_SCANS_SKIP_TO_TID;
-
-/* Added in v0.115, enabled in v0.115, remove after v0.117 */
-#define DEFAULT_ENABLE_TAILABLE_CURSOR_MAX_AWAIT_TIME true
-bool EnableTailableCursorMaxAwaitTime = DEFAULT_ENABLE_TAILABLE_CURSOR_MAX_AWAIT_TIME;
-
-/* Added in v0.111, enabled in v0.115, remove after v0.117 */
-#define DEFAULT_FAIL_ON_NON_EMPTY_GROUP_COUNT_ARG true
-bool FailOnNonEmptyGroupCountArg = DEFAULT_FAIL_ON_NON_EMPTY_GROUP_COUNT_ARG;
 
 /* Added in v0.115, enabled in v1.1, remove after v1.3 */
 #define DEFAULT_ENABLE_PROJECT_PUSHUP_BEFORE_UNWIND_WITH_GROUP true
@@ -452,38 +532,22 @@ bool EnableCompositeSecondaryPathOrderPushdown =
 bool EnableOrderedSaopMultiRangeSkipAdvance =
 	DEFAULT_ENABLE_ORDERED_SAOP_MULTI_RANGE_SKIP_ADVANCE;
 
-/* Added in v0.114, enabled in v0.114, remove after v0.117 */
-#define DEFAULT_ENABLE_STRICT_ADDTOSET_MODIFIER_VALIDATION true
-bool EnableStrictAddToSetModifierValidation =
-	DEFAULT_ENABLE_STRICT_ADDTOSET_MODIFIER_VALIDATION;
-
-/* Added in v0.114, enabled in v0.114, remove after v0.117 */
-#define DEFAULT_ENABLE_OBJECTID_FUNC_EXPR_CONVERSION true
-bool EnableObjectIdFuncExprConversion = DEFAULT_ENABLE_OBJECTID_FUNC_EXPR_CONVERSION;
-
-/* Added in v0.114, enabled in v0.114, remove after v0.117 */
-#define DEFAULT_ENABLE_SAMPLE_SCAN_FIX_ON_SHARDED true
-bool EnableSampleScanFixOnSharded = DEFAULT_ENABLE_SAMPLE_SCAN_FIX_ON_SHARDED;
-
 /* Added on v1.1, enabled on v1.1, remove after v1.3 */
 #define DEFAULT_ENABLE_SAMPLE_SCAN_PUSHDOWN_FOR_DYNAMIC_CURSOR true
 bool EnableSampleScanPushdownForDynamicCursor =
 	DEFAULT_ENABLE_SAMPLE_SCAN_PUSHDOWN_FOR_DYNAMIC_CURSOR;
 
-/* Added in v0.115, Pending stabilization, enable in v1.1 */
+/* Added in v0.115, Pending stabilization, enable in v1.4 */
 #define DEFAULT_ENABLE_ADD_SHARD_KEY_ONLY_ON_PRIMARY_KEY_FILTERS false
 bool EnableAddShardKeyOnlyOnPrimaryKeyFilters =
 	DEFAULT_ENABLE_ADD_SHARD_KEY_ONLY_ON_PRIMARY_KEY_FILTERS;
 
-/* Added in v0.115, enabled in v0.115, remove after v0.117 */
-#define DEFAULT_ENABLE_SUBQUERY_PUSHDOWN_FOR_MATCH true
-bool EnableSubqueryPushdownForMatch = DEFAULT_ENABLE_SUBQUERY_PUSHDOWN_FOR_MATCH;
+/* Added on v1.1, pending stabilization, enable on v1.3 */
+#define DEFAULT_ENABLE_SUBQUERY_PUSHDOWN_FOR_MATCH_ON_PERSISTED_CURSORS false
+bool EnableSubqueryPushdownForMatchOnPersistedCursors =
+	DEFAULT_ENABLE_SUBQUERY_PUSHDOWN_FOR_MATCH_ON_PERSISTED_CURSORS;
 
-/* Added in v0.114, enabled in v0.114, remove after v0.117 */
-#define DEFAULT_ENABLE_DOLLAR_SAMPLE_RESERVOIR_SCAN true
-bool EnableDollarSampleReservoirScan = DEFAULT_ENABLE_DOLLAR_SAMPLE_RESERVOIR_SCAN;
-
-/* Added in v0.117, Pending stabilization, enable in v1.1 */
+/* Added in v0.117, Pending stabilization, enable in v1.3 */
 #define DEFAULT_ENABLE_RUM_INDEX_ONLY_SCAN_PROJECTION_WRAPPER false
 bool EnableRumIndexOnlyScanProjectionWrapper =
 	DEFAULT_ENABLE_RUM_INDEX_ONLY_SCAN_PROJECTION_WRAPPER;
@@ -493,13 +557,13 @@ bool EnableRumIndexOnlyScanProjectionWrapper =
 bool EnableDollarSampleHeapSkipReservoirScan =
 	DEFAULT_ENABLE_DOLLAR_SAMPLE_HEAP_SKIP_RESERVOIR_SCAN;
 
-/* Added in v0.114, enabled in v0.114, remove after v0.117 */
-#define DEFAULT_ENABLE_SKIP_COMMENT_FIELD_ON_UPSERT true
-bool EnableSkipCommentFieldOnUpsert = DEFAULT_ENABLE_SKIP_COMMENT_FIELD_ON_UPSERT;
-
 /* Added in v0.116, enabled in v0.116, remove after v1.1 */
 #define DEFAULT_ENABLE_EXISTENTIAL_NULL_ARRAY_MATCH true
 bool EnableExistentialNullArrayMatch = DEFAULT_ENABLE_EXISTENTIAL_NULL_ARRAY_MATCH;
+
+/* Added on v1.1, enabled on v1.1, remove after v1.3 */
+#define DEFAULT_ENABLE_MERGE_GENERATED_ID_CONSISTENCY true
+bool EnableMergeGeneratedIdConsistency = DEFAULT_ENABLE_MERGE_GENERATED_ID_CONSISTENCY;
 
 /*
  * SECTION: Lookup feature flags
@@ -515,6 +579,11 @@ bool ForceNestedLookupPipelineAfterJoin =
 bool EnableLookupJoinIndexWithLinearPipeline =
 	DEFAULT_ENABLE_LOOKUP_JOIN_INDEX_WITH_LINEAR_PIPELINE;
 
+/* Added on v1.2, enabled on v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_LOOKUP_JOIN_SELECTIVITY_FROM_STATS true
+bool EnableLookupJoinSelectivityFromStats =
+	DEFAULT_ENABLE_LOOKUP_JOIN_SELECTIVITY_FROM_STATS;
+
 /*
  * SECTION: Collation feature flags
  */
@@ -527,6 +596,16 @@ bool SkipFailOnCollation = DEFAULT_SKIP_FAIL_ON_COLLATION;
 #define DEFAULT_ENABLE_COLLATION_WITH_NON_UNIQUE_ORDERED_INDEXES false
 bool EnableCollationWithNonUniqueOrderedIndexes =
 	DEFAULT_ENABLE_COLLATION_WITH_NON_UNIQUE_ORDERED_INDEXES;
+
+/* Added on v1.3, pending stabilization, enable on v1.5 */
+#define DEFAULT_ENABLE_COLLATION_WITH_CREATE_COLLECTION false
+bool EnableCollationWithCreateCollection =
+	DEFAULT_ENABLE_COLLATION_WITH_CREATE_COLLECTION;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.4 */
+#define DEFAULT_FAIL_ON_COLLATED_INDEX_TERM_TRUNCATION true
+bool FailOnCollatedIndexTermTruncation =
+	DEFAULT_FAIL_ON_COLLATED_INDEX_TERM_TRUNCATION;
 
 /*
  * SECTION: Cluster administration & DDL feature flags
@@ -566,7 +645,7 @@ bool EnableNewNamespaceValidation =
  * SECTION: Write path feature flags
  */
 
-/* Added in v0.116, Pending stabilization, enable in v1.1 */
+/* Added in v0.116, Pending stabilization, enable in v1.3 */
 #define DEFAULT_ENABLE_UPDATE_MANY_WORKER_PUSHDOWN false
 bool EnableUpdateManyWorkerPushdown = DEFAULT_ENABLE_UPDATE_MANY_WORKER_PUSHDOWN;
 
@@ -583,6 +662,25 @@ bool EnableCommutativeUpdateMany =
 bool EnableCommutativeDeleteMany =
 	DEFAULT_ENABLE_COMMUTATIVE_DELETE_MANY;
 
+/* Added in v1.2, pending stabilization, enable in v1.3 */
+#define DEFAULT_ENABLE_UPDATE_WORKER_PLAN_CACHE false
+bool EnableUpdateWorkerPlanCache =
+	DEFAULT_ENABLE_UPDATE_WORKER_PLAN_CACHE;
+
+/* Added in v1.2, pending stabilization, enable in v1.3 */
+#define DEFAULT_ENABLE_UPDATE_WORKER_SINGLE_WRITE_NO_SUB_TRANSACTION false
+bool EnableUpdateWorkerSingleWriteNoSubTransaction =
+	DEFAULT_ENABLE_UPDATE_WORKER_SINGLE_WRITE_NO_SUB_TRANSACTION;
+
+/* Added in v1.2, pending stabilization, enable in v1.3 */
+#define DEFAULT_ENABLE_ARRAY_BSON_STATS_WITH_PLANNER_STATISTICS false
+bool EnableArrayBsonStatsWithPlannerStatistics =
+	DEFAULT_ENABLE_ARRAY_BSON_STATS_WITH_PLANNER_STATISTICS;
+
+/* Added on v1.2, enabled on v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_IN_GRANULAR_SELECTIVITY true
+bool EnableInGranularSelectivity = DEFAULT_ENABLE_IN_GRANULAR_SELECTIVITY;
+
 
 /*
  * SECTION: Changestream feature flags
@@ -592,15 +690,23 @@ bool EnableCommutativeDeleteMany =
 #define DEFAULT_REMOVE_MATCH_NAMESPACE_FILTERS true
 bool RemoveMatchNamespaceFilters = DEFAULT_REMOVE_MATCH_NAMESPACE_FILTERS;
 
-/* Added in v0.112, Pending stabilization, enable in v1.2 */
-#define DEFAULT_ENABLE_PREIMAGES false
+/* Added in v0.112, enabled in v1.2, remove after v1.4 */
+#define DEFAULT_ENABLE_PREIMAGES true
 bool EnablePreImages = DEFAULT_ENABLE_PREIMAGES;
 
 /*
  * SECTION: Schedule jobs via background worker.
  */
 
-/* Added in v0.109, Pending stabilization, enable in v1.2 */
+/* Added in v1.2, Pending stabilization, enable in v1.5 */
+#define DEFAULT_ENABLE_CURSOR_CLEANUP_BACKGROUND false
+bool EnableCursorCleanupBackground = DEFAULT_ENABLE_CURSOR_CLEANUP_BACKGROUND;
+
+/* Added in v1.2, Pending stabilization, enable in v1.6 */
+#define DEFAULT_ENABLE_TTL_CLEANUP_BACKGROUND false
+bool EnableTTLCleanupBackground = DEFAULT_ENABLE_TTL_CLEANUP_BACKGROUND;
+
+/* Added in v0.109, Pending stabilization, enable in v1.8 */
 #define DEFAULT_INDEX_BUILDS_SCHEDULED_ON_BGWORKER false
 bool IndexBuildsScheduledOnBgWorker = DEFAULT_INDEX_BUILDS_SCHEDULED_ON_BGWORKER;
 
@@ -680,6 +786,72 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_bson_type_argument_validation", prefix),
+		gettext_noop(
+			"Whether or not to enforce BSON argument type validation for findAndModify, $jsonSchema, getParameter, listIndexes, and dropIndexes."),
+		NULL,
+		&EnableBsonTypeArgumentValidation,
+		DEFAULT_ENABLE_BSON_TYPE_ARGUMENT_VALIDATION,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_read_concern_validation", prefix),
+		gettext_noop(
+			"Whether or not to enforce readConcern field and sub-field validation in the gateways."),
+		NULL,
+		&EnableReadConcernValidation,
+		DEFAULT_ENABLE_READ_CONCERN_VALIDATION,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_session_argument_validation", prefix),
+		gettext_noop(
+			"Whether or not to enforce session command argument-shape validation in the gateways. Authorization and session termination remain active when disabled."),
+		NULL,
+		&EnableSessionArgumentValidation,
+		DEFAULT_ENABLE_SESSION_ARGUMENT_VALIDATION,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_getmore_argument_validation", prefix),
+		gettext_noop(
+			"Whether or not to enforce getMore command argument validation in the gateways."),
+		NULL,
+		&EnableGetMoreArgumentValidation,
+		DEFAULT_ENABLE_GETMORE_ARGUMENT_VALIDATION,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_server_status_command", prefix),
+		gettext_noop(
+			"Whether or not the gateways handle the serverStatus command. When disabled the command is reported as unsupported."),
+		NULL,
+		&EnableServerStatusCommand,
+		DEFAULT_ENABLE_SERVER_STATUS_COMMAND,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_collation_with_schema_validation", newGucPrefix),
+		gettext_noop(
+			"Whether multi-document updates validate with the collection collation."),
+		NULL,
+		&EnableCollationWithSchemaValidation,
+		DEFAULT_ENABLE_COLLATION_WITH_SCHEMA_VALIDATION,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.enableBypassDocumentValidation", prefix),
 		gettext_noop(
 			"Whether or not to support 'bypassDocumentValidation'."),
@@ -728,6 +900,22 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_collation_with_create_collection", newGucPrefix),
+		gettext_noop(
+			"Whether collation can be specified when creating an unsharded collection."),
+		NULL, &EnableCollationWithCreateCollection,
+		DEFAULT_ENABLE_COLLATION_WITH_CREATE_COLLECTION,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.fail_on_collated_index_term_truncation", newGucPrefix),
+		gettext_noop(
+			"Whether to fail when a collated term generated from an indexed or query value requires truncation."),
+		NULL, &FailOnCollatedIndexTermTruncation,
+		DEFAULT_FAIL_ON_COLLATED_INDEX_TERM_TRUNCATION,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.force_nested_lookup_pipeline_after_join", newGucPrefix),
 		gettext_noop(
 			"Whether nested lookup stages are forced to run after the parent equality join. Unsupported query shapes may fail when this setting is enabled."),
@@ -744,11 +932,26 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_lookup_join_selectivity_from_stats", newGucPrefix),
+		gettext_noop(
+			"Whether the inner side of a lookup join derives its selectivity from collected statistics instead of a fixed fallback."),
+		NULL, &EnableLookupJoinSelectivityFromStats,
+		DEFAULT_ENABLE_LOOKUP_JOIN_SELECTIVITY_FROM_STATS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.enablePrimaryKeyCursorScan", newGucPrefix),
 		gettext_noop(
 			"Whether or not to enable primary key cursor scan for streaming cursors."),
 		NULL, &EnablePrimaryKeyCursorScan,
 		DEFAULT_ENABLE_PRIMARY_KEY_CURSOR_SCAN,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_date_trunc_day_with_pg_bin", newGucPrefix),
+		gettext_noop(
+			"Whether to use PostgreSQL date_bin for day truncation within its timestamp range. When off, use legacy interval-based day truncation."),
+		NULL, &EnableDateTruncDayWithPgBin, DEFAULT_ENABLE_DATE_TRUNC_DAY_WITH_PG_BIN,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -767,14 +970,6 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		psprintf("%s.enableDynamicPersistentCursorsWithStats", newGucPrefix),
-		gettext_noop(
-			"Whether or not to enable dynamic persistent cursors with statistics."),
-		NULL, &EnableDynamicPersistentCursorsWithStats,
-		DEFAULT_ENABLE_DYNAMIC_PERSISTENT_CURSORS_WITH_STATS,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
 		psprintf("%s.enable_dynamic_cursor_with_skiplimit", newGucPrefix),
 		gettext_noop(
 			"Whether or not to allow a query with a positive skip or a positive "
@@ -784,14 +979,6 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"it."),
 		NULL, &EnableDynamicCursorWithSkipLimit,
 		DEFAULT_ENABLE_DYNAMIC_CURSOR_WITH_SKIPLIMIT,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enableDynamicCursorFastStartupScan", newGucPrefix),
-		gettext_noop(
-			"Whether or not to enable fast startup scan for dynamic cursors."),
-		NULL, &EnableDynamicCursorFastStartupScan,
-		DEFAULT_ENABLE_DYNAMIC_CURSOR_FAST_STARTUP_SCAN,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -811,6 +998,22 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_non_dynamic_cursor_parallel_plans", newGucPrefix),
+		gettext_noop(
+			"Whether to allow parallel plans for non-dynamic cursors and single-result queries."),
+		NULL, &EnableNonDynamicCursorParallelPlans,
+		DEFAULT_ENABLE_NON_DYNAMIC_CURSOR_PARALLEL_PLANS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_skip_parallel_plans_without_stats", newGucPrefix),
+		gettext_noop(
+			"Whether dynamic cursor planning skips parallel scans when collection statistics are unavailable."),
+		NULL, &EnableSkipParallelPlansWithoutStats,
+		DEFAULT_ENABLE_SKIP_PARALLEL_PLANS_WITHOUT_STATS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.enable_dynamic_cursor_dedup_tracking", newGucPrefix),
 		gettext_noop(
 			"Whether dynamic cursors track deduplication state for ordered "
@@ -823,15 +1026,6 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		psprintf("%s.enable_single_result_query_parallel_plans", newGucPrefix),
-		gettext_noop(
-			"Whether or not to allow parallel plans for single-result queries "
-			"(e.g. count/distinct)."),
-		NULL, &EnableSingleResultQueryParallelPlans,
-		DEFAULT_ENABLE_SINGLE_RESULT_QUERY_PARALLEL_PLANS,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
 		psprintf("%s.enable_group_by_dynamic_streaming", newGucPrefix),
 		gettext_noop(
 			"Whether or not to allow a fully pushable $group (with or without "
@@ -839,15 +1033,6 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"to use a dynamic streaming cursor instead of a persisted cursor."),
 		NULL, &EnableGroupByDynamicStreaming,
 		DEFAULT_ENABLE_GROUP_BY_DYNAMIC_STREAMING,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enablePGPrngCursorId", newGucPrefix),
-		gettext_noop(
-			"Whether cursor ids use the fast non-cryptographic PRNG (true) or "
-			"the strong CSPRNG (false)."),
-		NULL, &EnablePGPrngCursorId,
-		DEFAULT_ENABLE_PG_PRNG_CURSOR_ID,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -873,6 +1058,39 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"collection table access are enabled."),
 		NULL, &EnableReadWriteAnyDatabaseRoleEnforcement,
 		DEFAULT_ENABLE_READWRITE_ANY_DATABASE_ROLE_ENFORCEMENT,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_composite_unique_optional_key", newGucPrefix),
+		gettext_noop(
+			"Whether to enable optional-key support for composite unique indexes."),
+		NULL, &EnableCompositeUniqueOptionalKey,
+		DEFAULT_ENABLE_COMPOSITE_UNIQUE_OPTIONAL_KEY,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_unique_null_missing_equivalence", newGucPrefix),
+		gettext_noop(
+			"Whether the unique index recheck treats a missing path as equal to a "
+			"null value."),
+		NULL, &EnableUniqueNullMissingEquivalence,
+		DEFAULT_ENABLE_UNIQUE_NULL_MISSING_EQUIVALENCE,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_unique_null_missing_semantics", newGucPrefix),
+		gettext_noop(
+			"Whether unique index null/missing conflict checks use corrected semantics."),
+		NULL, &EnableUniqueNullMissingSemantics,
+		DEFAULT_ENABLE_UNIQUE_NULL_MISSING_SEMANTICS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_collated_unique_indexes", newGucPrefix),
+		gettext_noop(
+			"Whether to allow unique indexes to be built with a collation."),
+		NULL, &EnableCollatedUniqueIndexes,
+		DEFAULT_ENABLE_COLLATED_UNIQUE_INDEXES,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -956,6 +1174,14 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"Whether to skip setting the order scan direction for a full scan expression"),
 		NULL, &EnableSkipSettingOrderScanDirectionForFullScanExpr,
 		DEFAULT_ENABLE_SKIP_SETTING_ORDER_SCAN_DIRECTION_FOR_FULL_SCAN_EXPR,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_full_scan_cost_and_selectivity", newGucPrefix),
+		gettext_noop(
+			"Whether full-scan planner support reports all rows selected with negligible execution cost."),
+		NULL, &EnableFullScanCostAndSelectivity,
+		DEFAULT_ENABLE_FULL_SCAN_COST_AND_SELECTIVITY,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1069,6 +1295,21 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_order_by_id_on_cost_function_with_stats", newGucPrefix),
+		gettext_noop(
+			"Whether to enable cost-based primary-key ordering when statistics are available."),
+		NULL, &EnableOrderByIdOnCostFunctionWithStats,
+		DEFAULT_ENABLE_ORDER_BY_ID_ON_COST_WITH_STATS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_btree_order_by_with_filters", newGucPrefix),
+		gettext_noop(
+			"Whether ordered primary-key index scans retain matching index filters."),
+		NULL, &EnableBtreeOrderByWithFilters, DEFAULT_ENABLE_BTREE_ORDER_BY_WITH_FILTERS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.enableValueOnlyIndexTerms", newGucPrefix),
 		gettext_noop(
 			"Whether to enable index terms that are value only."),
@@ -1102,15 +1343,6 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 			"Whether to enable non-blocking background builds of unique indexes."),
 		NULL, &EnableNonBlockingUniqueIndexBuild,
 		DEFAULT_ENABLE_NON_BLOCKING_UNIQUE_INDEX_BUILD,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-
-	DefineCustomBoolVariable(
-		psprintf("%s.failOnNonEmptyGroupCountArg", newGucPrefix),
-		gettext_noop(
-			"Whether to fail when $count accumulator in $group has non-empty arguments."),
-		NULL, &FailOnNonEmptyGroupCountArg,
-		DEFAULT_FAIL_ON_NON_EMPTY_GROUP_COUNT_ARG,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1272,11 +1504,44 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_distinct_multi_key_sort_pushdown", newGucPrefix),
+		gettext_noop(
+			"Whether to allow order-by pushdown for a distinct over a multi-key composite ordered index when the per-path multi-key bitmask proves the distinct column is scalar and every preceding column is pinned by an equality bound. When off, any distinct on a multi-key index blocks order-by pushdown and therefore the distinct skip scan. A multi-key equality prefix can emit one index tuple per matching array element, but those tuples repeat the same distinct value and are collapsed by the distinct itself."),
+		NULL, &EnableDistinctMultiKeySortPushdown,
+		DEFAULT_ENABLE_DISTINCT_MULTI_KEY_SORT_PUSHDOWN,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_skip_sort_pushdown_for_non_point_equalities",
+				 newGucPrefix),
+		gettext_noop(
+			"Whether to skip order-by pushdown across equality predicates that span multiple index terms."),
+		NULL, &EnableSkipSortPushdownForNonPointEqualities,
+		DEFAULT_ENABLE_SKIP_SORT_PUSHDOWN_FOR_NON_POINT_EQUALITIES,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.enable_index_correlation_from_statistics", newGucPrefix),
 		gettext_noop(
 			"Whether to source the physical-order correlation of a composite index's leading path from extended statistics during cost estimation. When off, the correlation defaults to the base access method estimate."),
 		NULL, &EnableIndexCorrelationFromStatistics,
 		DEFAULT_ENABLE_INDEX_CORRELATION_FROM_STATISTICS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_composite_range_selectivity", newGucPrefix),
+		gettext_noop(
+			"Whether to combine multiple range conditions on a composite index path for selectivity estimation."),
+		NULL, &EnableCompositeRangeSelectivity,
+		DEFAULT_ENABLE_COMPOSITE_RANGE_SELECTIVITY,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_elem_match_selectivity_from_stats", newGucPrefix),
+		gettext_noop(
+			"Whether to estimate $elemMatch predicates and retained index bounds from per-path statistics instead of fixed fallback selectivity."),
+		NULL, &EnableElemMatchSelectivityFromStats,
+		DEFAULT_ENABLE_ELEM_MATCH_SELECTIVITY_FROM_STATS,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1331,19 +1596,27 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_cursor_cleanup_background", newGucPrefix),
+		gettext_noop(
+			"Reserved for future role-neutral cursor cleanup through the background worker."),
+		NULL, &EnableCursorCleanupBackground,
+		DEFAULT_ENABLE_CURSOR_CLEANUP_BACKGROUND,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_ttl_cleanup_background", newGucPrefix),
+		gettext_noop(
+			"Enable expired-row cleanup through the background-worker entry point."),
+		NULL, &EnableTTLCleanupBackground,
+		DEFAULT_ENABLE_TTL_CLEANUP_BACKGROUND,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.indexBuildsScheduledOnBgWorker", newGucPrefix),
 		gettext_noop(
 			"Whether to schedule index builds via background worker jobs."),
 		NULL, &IndexBuildsScheduledOnBgWorker,
 		DEFAULT_INDEX_BUILDS_SCHEDULED_ON_BGWORKER,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enableTailableCursorMaxAwaitTime", newGucPrefix),
-		gettext_noop(
-			"Kill switch for tailable cursor maxAwaitTimeMS support. When off, the backend ignores the maxAwaitTimeMS getMore field, treats maxTimeMS as a statement timeout for all cursor kinds, and never returns a polling hint to the gateway."),
-		NULL, &EnableTailableCursorMaxAwaitTime,
-		DEFAULT_ENABLE_TAILABLE_CURSOR_MAX_AWAIT_TIME,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1389,13 +1662,22 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		psprintf("%s.skip_legacy_id_index_stats_check", newGucPrefix),
+		psprintf("%s.enable_array_bson_stats_with_planner_statistics", newGucPrefix),
 		gettext_noop(
-			"Whether to skip the legacy _id_ index-options fallback when "
-			"checking if a collection has planner statistics enabled. Skipped "
-			"by default; retained for backward compatibility and will be retired."),
-		NULL, &SkipLegacyIdIndexStatsCheck,
-		DEFAULT_SKIP_LEGACY_ID_INDEX_STATS_CHECK,
+			"Whether ANALYZE collects per-collection planner statistics over the "
+			"elements of array values. Applies only when planner statistics are "
+			"enabled for new collections."),
+		NULL, &EnableArrayBsonStatsWithPlannerStatistics,
+		DEFAULT_ENABLE_ARRAY_BSON_STATS_WITH_PLANNER_STATISTICS,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_in_granular_selectivity", newGucPrefix),
+		gettext_noop(
+			"Whether to estimate $in and $nin selectivity from per-collection "
+			"planner statistics."),
+		NULL, &EnableInGranularSelectivity,
+		DEFAULT_ENABLE_IN_GRANULAR_SELECTIVITY,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1431,39 +1713,12 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		psprintf("%s.enableStrictAddToSetModifierValidation", newGucPrefix),
-		gettext_noop(
-			"Reject $position/$slice/$sort (or any non-$each sibling) inside $addToSet, matching MongoDB behavior."),
-		NULL, &EnableStrictAddToSetModifierValidation,
-		DEFAULT_ENABLE_STRICT_ADDTOSET_MODIFIER_VALIDATION,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
 		psprintf("%s.enableNewNamespaceValidation", newGucPrefix),
 		gettext_noop(
 			"Whether to enable new namespace validation."),
 		NULL, &EnableNewNamespaceValidation,
 		DEFAULT_ENABLE_NEW_NAMESPACE_VALIDATION,
 		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enableObjectIdFuncExprConversion", newGucPrefix),
-		gettext_noop(
-			"Whether to enable conversion of ObjectId function expressions."),
-		NULL, &EnableObjectIdFuncExprConversion,
-		DEFAULT_ENABLE_OBJECTID_FUNC_EXPR_CONVERSION,
-		PGC_USERSET, 0, NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enableSampleScanFixOnSharded", newGucPrefix),
-		gettext_noop(
-			"Enables fix for $sample TABLESAMPLE on sharded collections."),
-		NULL,
-		&EnableSampleScanFixOnSharded,
-		DEFAULT_ENABLE_SAMPLE_SCAN_FIX_ON_SHARDED,
-		PGC_USERSET,
-		0,
-		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		psprintf("%s.enable_sample_scan_pushdown_for_dynamic_cursor", newGucPrefix),
@@ -1488,25 +1743,15 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		0,
 		NULL, NULL, NULL);
 
-
 	DefineCustomBoolVariable(
-		psprintf("%s.enableSubqueryPushdownForMatch", newGucPrefix),
+		psprintf("%s.enable_subquery_pushdown_for_match_on_persisted_cursors",
+				 newGucPrefix),
 		gettext_noop(
-			"Whether to enable pushdown of subqueries for match operations."),
+			"Whether to enable pushdown of subqueries for match operations when the "
+			"query uses persisted cursors (i.e. dynamic cursors are not enabled)."),
 		NULL,
-		&EnableSubqueryPushdownForMatch,
-		DEFAULT_ENABLE_SUBQUERY_PUSHDOWN_FOR_MATCH,
-		PGC_USERSET,
-		0,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		psprintf("%s.enableSkipCommentFieldOnUpsert", newGucPrefix),
-		gettext_noop(
-			"Whether to skip persisting the $comment query metadata field onto the document generated during an upsert."),
-		NULL,
-		&EnableSkipCommentFieldOnUpsert,
-		DEFAULT_ENABLE_SKIP_COMMENT_FIELD_ON_UPSERT,
+		&EnableSubqueryPushdownForMatchOnPersistedCursors,
+		DEFAULT_ENABLE_SUBQUERY_PUSHDOWN_FOR_MATCH_ON_PERSISTED_CURSORS,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
@@ -1568,12 +1813,24 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		psprintf("%s.enableDollarSampleReservoirScan", newGucPrefix),
+		psprintf("%s.enable_update_worker_plan_cache", newGucPrefix),
 		gettext_noop(
-			"Whether to use reservoir sampling for $sample instead of ORDER BY random()."),
+			"Whether to reuse a cached prepared plan for the per-op update worker dispatch to avoid re-parsing and re-planning on every operation."),
 		NULL,
-		&EnableDollarSampleReservoirScan,
-		DEFAULT_ENABLE_DOLLAR_SAMPLE_RESERVOIR_SCAN,
+		&EnableUpdateWorkerPlanCache,
+		DEFAULT_ENABLE_UPDATE_WORKER_PLAN_CACHE,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_update_worker_single_write_no_sub_transaction",
+				 newGucPrefix),
+		gettext_noop(
+			"Whether a single update pushed to the update worker skips the worker side sub-transaction, letting the caller roll back and report the failure instead."),
+		NULL,
+		&EnableUpdateWorkerSingleWriteNoSubTransaction,
+		DEFAULT_ENABLE_UPDATE_WORKER_SINGLE_WRITE_NO_SUB_TRANSACTION,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
@@ -1615,6 +1872,17 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		psprintf("%s.enable_support_object_id_function_pfe_pushdown", newGucPrefix),
+		gettext_noop(
+			"Whether _id support functions participate in partial index implication."),
+		NULL,
+		&EnableSupportObjectIdFunctionPfePushdown,
+		DEFAULT_ENABLE_SUPPORT_OBJECT_ID_FUNCTION_PFE_PUSHDOWN,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		psprintf("%s.enable_existential_null_array_match", newGucPrefix),
 		gettext_noop(
 			"Whether equality-to-null on a dotted path uses existential semantics "
@@ -1622,6 +1890,18 @@ InitializeFeatureFlagConfigurations(const char *prefix, const char *newGucPrefix
 		NULL,
 		&EnableExistentialNullArrayMatch,
 		DEFAULT_ENABLE_EXISTENTIAL_NULL_ARRAY_MATCH,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		psprintf("%s.enable_merge_generated_id_consistency", newGucPrefix),
+		gettext_noop(
+			"Whether $merge/$out reuse a single generated object ID for both "
+			"the physical row's object_id and the document's _id."),
+		NULL,
+		&EnableMergeGeneratedIdConsistency,
+		DEFAULT_ENABLE_MERGE_GENERATED_ID_CONSISTENCY,
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);

@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/configs/limit_configs.c
  *
@@ -44,6 +45,18 @@ int ShardingMaxChunks = DEFAULT_SHARDING_MAX_CHUNKS;
 
 #define DEFAULT_QUERY_PLAN_CACHE_SIZE_LIMIT 100
 int QueryPlanCacheSizeLimit = DEFAULT_QUERY_PLAN_CACHE_SIZE_LIMIT;
+
+#define DEFAULT_MAX_EXPLAIN_INDEX_COSTS 8
+int MaxExplainIndexCosts = DEFAULT_MAX_EXPLAIN_INDEX_COSTS;
+
+/*
+ * Caps the BSON array size for which $in/$nin selectivity is estimated
+ * element by element. The estimator runs once per applicable index.
+ */
+#define DEFAULT_MAX_IN_GRANULAR_SELECTIVITY_INPUT_SIZE_BYTES 10000
+#define MAX_IN_GRANULAR_SELECTIVITY_INPUT_SIZE_BYTES_LIMIT 30000
+int MaxInGranularSelectivityInputSizeBytes =
+	DEFAULT_MAX_IN_GRANULAR_SELECTIVITY_INPUT_SIZE_BYTES;
 
 /* Cap on the number of ordered scans merged for an $in prefix. */
 #define DEFAULT_MAX_MERGE_SORT_IN_VALUES 200
@@ -167,6 +180,10 @@ bool IsNativeAuthEnabled = DEFAULT_ENABLE_NATIVE_AUTHENTICATION;
 #define DEFAULT_VECTOR_ITERATIVE_SCAN_MODE VectorIterativeScan_RELAXED_ORDER
 int VectorPreFilterIterativeScanMode = DEFAULT_VECTOR_ITERATIVE_SCAN_MODE;
 
+#define DEFAULT_VECTOR_AUTO_FILTER_SELECTIVITY_THRESHOLD 0.01
+double VectorAutoFilterSelectivityThreshold =
+	DEFAULT_VECTOR_AUTO_FILTER_SELECTIVITY_THRESHOLD;
+
 #define DEFAULT_ENABLE_GEONEAR_FORCE_INDEX_PUSHDOWN true
 bool EnableGeonearForceIndexPushdown = DEFAULT_ENABLE_GEONEAR_FORCE_INDEX_PUSHDOWN;
 
@@ -216,6 +233,10 @@ bool EnableCursorsOnAggregationQueryRewrite =
 #define ARRAY_STATISTICS_MAX_SAMPLE_COUNT 128
 #define DEFAULT_ARRAY_STATISTICS_MAX_SAMPLE_COUNT 10
 int ArrayStatisticsMaxSampleCount = DEFAULT_ARRAY_STATISTICS_MAX_SAMPLE_COUNT;
+
+/* -1 leaves the PostgreSQL default toast compression threshold in place */
+#define DEFAULT_DOCUMENT_TOAST_COMPRESSION_THRESHOLD -1
+int32_t DocumentToastCompressionThreshold = DEFAULT_DOCUMENT_TOAST_COMPRESSION_THRESHOLD;
 
 static struct config_enum_entry rum_load_options[4] = {
 	{ "none", RumLibraryLoadOption_None, false },
@@ -277,6 +298,25 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		PGC_USERSET,
 		0,
 		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.max_explain_index_costs", newGucPrefix),
+		gettext_noop(
+			"The maximum number of candidate index cost estimates reported per scan in explain output."),
+		gettext_noop(
+			"Requires enableExtendedExplainPlans and enableExplainScanIndexCosts."),
+		&MaxExplainIndexCosts,
+		DEFAULT_MAX_EXPLAIN_INDEX_COSTS, 1, MAX_EXPLAIN_COSTS_SIZE,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.max_in_granular_selectivity_input_size_bytes", newGucPrefix),
+		gettext_noop(
+			"The maximum BSON array size in bytes for element-by-element $in and $nin selectivity estimation."),
+		NULL, &MaxInGranularSelectivityInputSizeBytes,
+		DEFAULT_MAX_IN_GRANULAR_SELECTIVITY_INPUT_SIZE_BYTES, 1,
+		MAX_IN_GRANULAR_SELECTIVITY_INPUT_SIZE_BYTES_LIMIT,
+		PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
 		psprintf("%s.max_merge_sort_in_values", newGucPrefix),
@@ -510,6 +550,21 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		VECTOR_ITERATIVE_SCAN_OPTIONS,
 		PGC_USERSET, 0, NULL, NULL, NULL);
 
+	DefineCustomRealVariable(
+		psprintf("%s.vector_auto_filter_selectivity_threshold", newGucPrefix),
+		gettext_noop(
+			"The estimated filter selectivity threshold for pre-filtered vector "
+			"search with filterMode 'autoSelect'. Estimates at or below the larger "
+			"of this threshold and 1/default_statistics_target use the filter path; "
+			"estimates above both use the vector path. "
+			"The value is a fraction from 0 to 1, with 0.01 representing 1 percent. "
+			"Zero retains the estimated statistics floor; 1 keeps all "
+			"estimates on the filter path."),
+		NULL, &VectorAutoFilterSelectivityThreshold,
+		DEFAULT_VECTOR_AUTO_FILTER_SELECTIVITY_THRESHOLD,
+		0.0, 1.0,
+		PGC_USERSET, 0, NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		psprintf("%s.defaultCursorFirstPageBatchSize", newGucPrefix),
 		gettext_noop("The default batch size for the first page of a cursor."),
@@ -595,6 +650,15 @@ InitializeSystemConfigurations(const char *prefix, const char *newGucPrefix)
 		NULL, &ArrayStatisticsMaxSampleCount,
 		DEFAULT_ARRAY_STATISTICS_MAX_SAMPLE_COUNT,
 		1, ARRAY_STATISTICS_MAX_SAMPLE_COUNT, PGC_USERSET, 0, NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		psprintf("%s.document_toast_compression_threshold", newGucPrefix),
+		gettext_noop(
+			"The document size in bytes above which documents are compressed when toasted."),
+		gettext_noop("A value of -1 uses the PostgreSQL default threshold."),
+		&DocumentToastCompressionThreshold,
+		DEFAULT_DOCUMENT_TOAST_COMPRESSION_THRESHOLD,
+		-1, INT_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		psprintf("%s.enableCursorsOnAggregationQueryRewrite", newGucPrefix),

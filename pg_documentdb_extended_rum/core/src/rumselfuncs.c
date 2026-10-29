@@ -8,6 +8,7 @@
  * Portions Copyright (c) 2015-2022, Postgres Professional
  * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * SPDX-License-Identifier: MIT
  *
  *-------------------------------------------------------------------------
  */
@@ -55,7 +56,9 @@ static void PopulateIndexStatsInfo(IndexOptInfo *index, RumStatsData *ginStats,
 								   double *numEntryPages, double *numDataPages,
 								   double *numEntries);
 
-typedef List *(*BoundaryQualsSelectorFunc)(IndexPath *indexPath, int32_t *num_sa_scans);
+typedef List *(*BoundaryQualsSelectorFunc)(IndexPath *indexPath, int32_t *num_sa_scans,
+										   List **itemsToFree);
+typedef List *(*CostQualsSelectorFunc)(IndexPath *indexPath, List **itemsToFree);
 
 
 /*
@@ -78,6 +81,12 @@ RMGR_PG_FUNCTION_DEF(DocumentDBRumOrderedCostEstimate)
 	double *dataPagesProportionFetched = (double *) PG_GETARG_POINTER(11);
 	BoundaryQualsSelectorFunc boundaryQualsSelector =
 		(BoundaryQualsSelectorFunc) PG_GETARG_POINTER(12);
+
+	CostQualsSelectorFunc costedQualsSelectorFunc = NULL;
+	if (PG_NARGS() > 13)
+	{
+		costedQualsSelectorFunc = (CostQualsSelectorFunc) PG_GETARG_POINTER(13);
+	}
 
 	IndexOptInfo *index = path->indexinfo;
 	RumStatsData ginStats;
@@ -105,7 +114,9 @@ RMGR_PG_FUNCTION_DEF(DocumentDBRumOrderedCostEstimate)
 
 	int32_t num_sa_scans = 1;
 	int32_t boundaryQualsCount = 0;
-	List *boundaryIndexQuals = boundaryQualsSelector(path, &num_sa_scans);
+	List *boundaryItemsToFree = NIL;
+	List *boundaryIndexQuals = boundaryQualsSelector(path, &num_sa_scans,
+													 &boundaryItemsToFree);
 	orderedSelectivity = clauselist_selectivity(root, boundaryIndexQuals,
 												path->indexinfo->rel->relid,
 												JOIN_INNER,
@@ -115,11 +126,27 @@ RMGR_PG_FUNCTION_DEF(DocumentDBRumOrderedCostEstimate)
 	boundaryQualsCount = list_length(boundaryIndexQuals);
 	costs.num_sa_scans = Max(costs.num_sa_scans, num_sa_scans);
 	list_free(boundaryIndexQuals);
+	list_free_deep(boundaryItemsToFree);
 
 	costs.numIndexTuples = orderedSelectivity * statsNumTuples;
 
 	/* Use generic cost estimate for composite style indexes */
-	genericcostestimate(root, path, loop_count, &costs);
+
+	if (costedQualsSelectorFunc != NULL)
+	{
+		List *itemsToFree = NIL;
+		List *newQuals = costedQualsSelectorFunc(path, &itemsToFree);
+		List *oldQuals = path->indexclauses;
+		path->indexclauses = newQuals;
+		genericcostestimate(root, path, loop_count, &costs);
+		path->indexclauses = oldQuals;
+		list_free_deep(itemsToFree);
+	}
+	else
+	{
+		genericcostestimate(root, path, loop_count, &costs);
+	}
+
 	index->tuples = numTuples;
 
 	/* Account for descent cost, which is significant for large indexes */
