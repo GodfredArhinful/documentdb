@@ -1,13 +1,28 @@
+-- Copyright (c) Microsoft Corporation. All rights reserved.
+-- SPDX-License-Identifier: MIT
+
 SET search_path TO documentdb_api_catalog, documentdb_api, documentdb_core, documentdb_api_internal, public;
 SET documentdb.next_collection_id TO 6400;
 SET documentdb.next_collection_index_id TO 6400;
+SET documentdb.enablePerCollectionPlannerStatistics TO on;
+SET documentdb.enablePlannerStatisticsNewCollections TO off;
 
 -- create a collection
 SELECT documentdb_api.create_collection('stats_db', 'planner_stats');
 
 \d documentdb_data.documents_6401
 
+-- Legacy true must not enable statistics when the collection flag is absent.
+UPDATE documentdb_api_catalog.collection_indexes
+SET index_spec.index_options = '{"statsEnabled":true}'::documentdb_core.bson
+WHERE collection_id = 6401 AND (index_spec).index_name = '_id_';
 SELECT documentdb_api_internal.create_indexes_non_concurrently('stats_db', '{ "createIndexes": "planner_stats", "indexes": [ { "key": { "b": 1, "c": 1 }, "name": "b_c_1" } ] }', TRUE);
+SELECT count(*) AS stats_with_legacy_true
+FROM pg_statistic_ext
+WHERE stxrelid = 'documentdb_data.documents_6401'::regclass;
+UPDATE documentdb_api_catalog.collection_indexes
+SET index_spec.index_options = NULL
+WHERE collection_id = 6401 AND (index_spec).index_name = '_id_';
 
 -- enable planner statistics for the collection (should fail)
 set documentdb.enablePerCollectionPlannerStatistics to off;
@@ -22,7 +37,17 @@ SELECT options FROM documentdb_api_catalog.collections WHERE collection_id = 640
 SELECT documentdb_api_catalog.bson_dollar_unwind(cursorpage, '$cursor.firstBatch') FROM documentdb_api.list_indexes_cursor_first_page('stats_db', '{ "listIndexes": "planner_stats" }') ORDER BY 1;
 
 -- now create an index on the collection and verify that the planner statistics are updated for the index
+-- Legacy false must not override the enabled collection flag.
+UPDATE documentdb_api_catalog.collection_indexes
+SET index_spec.index_options = '{"statsEnabled":false}'::documentdb_core.bson
+WHERE collection_id = 6401 AND (index_spec).index_name = '_id_';
 SELECT documentdb_api_internal.create_indexes_non_concurrently('stats_db', '{ "createIndexes": "planner_stats", "indexes": [ { "key": { "a": 1 }, "name": "a_1" } ] }', TRUE);
+SELECT count(*) AS stats_with_legacy_false
+FROM pg_statistic_ext
+WHERE stxrelid = 'documentdb_data.documents_6401'::regclass;
+UPDATE documentdb_api_catalog.collection_indexes
+SET index_spec.index_options = NULL
+WHERE collection_id = 6401 AND (index_spec).index_name = '_id_';
 
 \d documentdb_data.documents_6401
 
@@ -594,3 +619,271 @@ SELECT options FROM documentdb_api_catalog.collections WHERE collection_id = 641
 SELECT documentdb_api.create_collection_view('stats_db', '{ "create": "create_stats_bad", "statsEnabled": "yes" }');
 
 RESET documentdb.enablePlannerStatisticsNewCollections;
+
+------------------------------------------------------------------------------
+-- Two-sided range predicates estimate the bounded interval directly.
+------------------------------------------------------------------------------
+SET documentdb.enablePerCollectionPlannerStatistics TO on;
+SET documentdb.enablePlannerStatisticsNewCollections TO on;
+SET documentdb.enableCompositeIndexPlanner TO on;
+SET documentdb.enableExplainScanIndexCosts TO on;
+SET documentdb.enableExtendedExplainPlans TO on;
+
+CREATE SCHEMA range_selectivity_helpers;
+CREATE FUNCTION range_selectivity_helpers.classify_index_selectivity(
+    p_filter text,
+    p_index text,
+    p_collation text DEFAULT NULL,
+    p_boundary boolean DEFAULT false)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_row text;
+    v_selectivity numeric;
+BEGIN
+    FOR v_row IN EXECUTE format(
+        'EXPLAIN (COSTS OFF) SELECT document '
+        'FROM documentdb_api_catalog.bson_aggregation_find(%L, %L)',
+        'stats_db',
+        format('{ "find": "range_selectivity", "filter": %s%s }', p_filter,
+               CASE WHEN p_collation IS NULL THEN ''
+                    ELSE ', "collation": ' || p_collation END))
+    LOOP
+        IF v_row LIKE '%' || p_index || ': (%startup cost=%selectivity=%' THEN
+            v_selectivity := substring(v_row from
+                CASE WHEN p_boundary THEN 'boundary selectivity=([0-9.eE+-]+)'
+                     ELSE 'selectivity=([0-9.eE+-]+)' END)::numeric;
+
+            IF v_selectivity < 0.1 THEN
+                RETURN 'combined range selectivity < 10%';
+            ELSIF v_selectivity < 0.2 THEN
+                RETURN 'combined range selectivity < 20%';
+            ELSIF v_selectivity < 0.4 THEN
+                RETURN 'combined range selectivity < 40%';
+            ELSIF v_selectivity < 0.5 THEN
+                RETURN 'combined range selectivity < 50%';
+            ELSIF v_selectivity < 0.6 THEN
+                RETURN 'combined range selectivity < 60%';
+            ELSIF v_selectivity < 0.8 THEN
+                RETURN 'combined range selectivity < 80%';
+            ELSIF v_selectivity <= 1.0 THEN
+                RETURN 'combined range selectivity <= 100%';
+            END IF;
+
+            RETURN format('unexpected combined range selectivity: %s',
+                          v_selectivity);
+        END IF;
+    END LOOP;
+
+    RETURN 'index not found in EXPLAIN output';
+END;
+$$;
+
+CREATE FUNCTION range_selectivity_helpers.count_matching_rows(p_filter text)
+RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_count bigint;
+BEGIN
+    EXECUTE format(
+        'SELECT COUNT(*) '
+        'FROM documentdb_api.collection(%L, %L) '
+        'WHERE document OPERATOR(documentdb_api_catalog.@@) %L',
+        'stats_db', 'range_selectivity', p_filter)
+    INTO v_count;
+    RETURN v_count;
+END;
+$$;
+
+SELECT documentdb_api.create_collection('stats_db', 'range_selectivity');
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'stats_db',
+    '{ "createIndexes": "range_selectivity", "indexes": [ { "key": { "a": 1 }, "name": "a_1" } ] }',
+    TRUE);
+SELECT COUNT(documentdb_api.insert_one(
+    'stats_db',
+    'range_selectivity',
+    bson_build_document('_id', value, 'a', value)))
+FROM generate_series(1, 100) AS value;
+ANALYZE documentdb_data.documents_6411;
+
+-- Values 46 through 54 satisfy both bounds, so the actual match rate is 9%.
+SELECT COUNT(*) AS actual_matching_rows
+FROM documentdb_api.collection('stats_db', 'range_selectivity')
+WHERE document OPERATOR(documentdb_api_catalog.@@)
+      '{ "a": { "$gt": 45, "$lt": 55 } }';
+
+-- With the feature disabled, the bounds retain the prior independent estimate.
+SET documentdb.enable_composite_range_selectivity TO off;
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 } }', 'a_1');
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 } }', 'a_1', NULL, true)
+    AS boundary_without_native_ranges;
+
+SET documentdb.enable_composite_range_selectivity TO on;
+
+-- With the feature enabled, the combined estimate reflects the approximately
+-- 9% bounded interval.
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 } }', 'a_1');
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 } }', 'a_1', NULL, true)
+    AS boundary_with_native_ranges;
+
+-- Cover inclusive and mixed bounds, an empty interval, one-sided inequality,
+-- and redundant same-direction bounds.
+SELECT scenario,
+       range_selectivity_helpers.count_matching_rows(filter)
+           AS actual_matching_rows,
+       range_selectivity_helpers.classify_index_selectivity(filter, 'a_1')
+           AS estimated_selectivity,
+       range_selectivity_helpers.classify_index_selectivity(
+           filter, 'a_1', NULL, true) AS boundary_selectivity
+FROM (VALUES
+    ('empty_gt_lt', '{ "a": { "$gt": 55, "$lt": 45 } }'),
+    ('gt_lte', '{ "a": { "$gt": 45, "$lte": 55 } }'),
+    ('gte_lt', '{ "a": { "$gte": 45, "$lt": 55 } }'),
+    ('gte_lte', '{ "a": { "$gte": 45, "$lte": 55 } }'),
+    ('one_sided_gt', '{ "a": { "$gt": 45 } }'),
+    ('redundant_lower',
+     '{ "$and": [ { "a": { "$gt": 45 } }, { "a": { "$gt": 55 } } ] }'),
+    ('redundant_upper',
+     '{ "$and": [ { "a": { "$lt": 55 } }, { "a": { "$lt": 45 } } ] }')
+) AS scenarios(scenario, filter)
+ORDER BY scenario;
+
+-- Add non-numeric values to the indexed field and repeat the range checks.
+SELECT COUNT(documentdb_api.insert_one(
+    'stats_db',
+    'range_selectivity',
+    format(
+        '{ "_id": %s, "a": %s }',
+        value,
+        CASE WHEN value % 2 = 0 THEN 'true' ELSE 'false' END
+    )::documentdb_core.bson))
+FROM generate_series(101, 150) AS value;
+
+SELECT COUNT(documentdb_api.insert_one(
+    'stats_db',
+    'range_selectivity',
+    format('{ "_id": %s, "a": null }', value)::documentdb_core.bson))
+FROM generate_series(151, 200) AS value;
+
+ANALYZE documentdb_data.documents_6411;
+
+-- The boolean and null values do not satisfy the numeric range.
+SELECT COUNT(*) AS actual_matching_rows
+FROM documentdb_api.collection('stats_db', 'range_selectivity')
+WHERE document OPERATOR(documentdb_api_catalog.@@)
+      '{ "a": { "$gt": 45, "$lt": 55 } }';
+
+SET documentdb.enable_composite_range_selectivity TO off;
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 } }', 'a_1');
+
+SET documentdb.enable_composite_range_selectivity TO on;
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 } }', 'a_1');
+
+SELECT scenario,
+       range_selectivity_helpers.count_matching_rows(filter)
+           AS actual_matching_rows,
+       range_selectivity_helpers.classify_index_selectivity(filter, 'a_1')
+           AS estimated_selectivity,
+       range_selectivity_helpers.classify_index_selectivity(
+           filter, 'a_1', NULL, true) AS boundary_selectivity
+FROM (VALUES
+    ('empty_gt_lt', '{ "a": { "$gt": 55, "$lt": 45 } }'),
+    ('gt_lte', '{ "a": { "$gt": 45, "$lte": 55 } }'),
+    ('gte_lt', '{ "a": { "$gte": 45, "$lt": 55 } }'),
+    ('gte_lte', '{ "a": { "$gte": 45, "$lte": 55 } }'),
+    ('one_sided_gt', '{ "a": { "$gt": 45 } }'),
+    ('redundant_lower',
+     '{ "$and": [ { "a": { "$gt": 45 } }, { "a": { "$gt": 55 } } ] }'),
+    ('redundant_upper',
+     '{ "$and": [ { "a": { "$lt": 55 } }, { "a": { "$lt": 45 } } ] }')
+) AS scenarios(scenario, filter)
+ORDER BY scenario;
+
+-- A MinKey lower bound excludes missing paths, unlike a native comparison
+-- against their projected null values. Keep the sparse predicate when another
+-- indexed path has a two-sided range.
+SET documentdb_core.enableCollation TO on;
+SET documentdb.enableCollationWithNonUniqueOrderedIndexes TO on;
+SELECT documentdb_api_internal.create_indexes_non_concurrently(
+    'stats_db',
+    '{ "createIndexes": "range_selectivity", "indexes": [ { "key": { "a": 1, "b": 1 }, "name": "a_b_1" }, { "key": { "a": 1, "b": 1 }, "name": "a_b_ci_1", "collation": { "locale": "en", "strength": 2 } } ] }',
+    TRUE);
+SELECT COUNT(documentdb_api.insert_one(
+    'stats_db', 'range_selectivity', document::documentdb_core.bson))
+FROM (VALUES
+    ('{ "_id": 201, "a": 50, "b": { "$minKey": 1 } }'),
+    ('{ "_id": 202, "a": 50, "b": null }'),
+    ('{ "_id": 203, "a": 50, "b": 42 }'),
+    ('{ "_id": 204, "a": 50, "b": "Score" }')
+) AS documents(document);
+ANALYZE documentdb_data.documents_6411;
+
+SET documentdb.enable_composite_range_selectivity TO off;
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gte": 1, "$lte": 100 }, "b": { "$exists": true } }', 'a_b_1')
+    AS sparse_exists_without_native_ranges;
+
+SET documentdb.enable_composite_range_selectivity TO on;
+SELECT scenario,
+       range_selectivity_helpers.count_matching_rows(filter)
+           AS actual_matching_rows,
+       range_selectivity_helpers.classify_index_selectivity(filter, 'a_b_1')
+           AS estimated_selectivity,
+       range_selectivity_helpers.classify_index_selectivity(
+           filter, 'a_b_1', NULL, true) AS boundary_selectivity
+FROM (VALUES
+    ('exists_true',
+     '{ "a": { "$gte": 1, "$lte": 100 }, "b": { "$exists": true } }'),
+    ('gte_minkey',
+     '{ "a": { "$gte": 1, "$lte": 100 }, "b": { "$gte": { "$minKey": 1 } } }'),
+    ('gt_minkey',
+     '{ "a": { "$gte": 1, "$lte": 100 }, "b": { "$gt": { "$minKey": 1 } } }')
+) AS scenarios(scenario, filter)
+ORDER BY scenario;
+
+-- Exercise the same rewrite with collation-bearing index bounds.
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gte": 1, "$lte": 100 }, "b": { "$exists": true } }',
+    'a_b_ci_1', '{ "locale": "en", "strength": 2 }')
+    AS sparse_exists_with_collation;
+SELECT document
+FROM documentdb_api_catalog.bson_aggregation_find(
+    'stats_db',
+    '{ "find": "range_selectivity", "filter": { "a": { "$gte": 1, "$lte": 100 }, "b": { "$exists": true } }, "sort": { "_id": 1 }, "collation": { "locale": "en", "strength": 2 } }');
+
+-- Traverse only the bounded leading range, regardless of a trailing sparse
+-- predicate. Cover scalar and multikey trailing paths with the same range.
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 }, "b": { "$exists": true } }',
+    'a_b_1', NULL, true) AS scalar_compound_boundary;
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 }, "b": { "$exists": true } }',
+    'a_b_ci_1', '{ "locale": "en", "strength": 2 }', true)
+    AS collated_compound_boundary;
+
+SELECT documentdb_api.insert_one(
+    'stats_db', 'range_selectivity', '{ "_id": 205, "a": 50, "b": [42, 43, 44] }');
+ANALYZE documentdb_data.documents_6411;
+SELECT range_selectivity_helpers.count_matching_rows(
+    '{ "a": { "$gt": 45, "$lt": 55 }, "b": { "$exists": true } }')
+    AS multikey_actual_matching_rows;
+SELECT range_selectivity_helpers.classify_index_selectivity(
+    '{ "a": { "$gt": 45, "$lt": 55 }, "b": { "$exists": true } }',
+    'a_b_1', NULL, true) AS multikey_compound_boundary;
+
+DROP SCHEMA range_selectivity_helpers CASCADE;
+RESET documentdb_core.enableCollation;
+RESET documentdb.enableCollationWithNonUniqueOrderedIndexes;
+RESET documentdb.enable_composite_range_selectivity;
+RESET documentdb.enablePerCollectionPlannerStatistics;
+RESET documentdb.enablePlannerStatisticsNewCollections;
+RESET documentdb.enableCompositeIndexPlanner;
+RESET documentdb.enableExplainScanIndexCosts;
+RESET documentdb.enableExtendedExplainPlans;

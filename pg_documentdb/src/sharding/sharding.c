@@ -1,5 +1,7 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * Licensed under the MIT License. See LICENSE in the project root for license information.
+ * SPDX-License-Identifier: MIT
  *
  * src/sharding.c
  *
@@ -1446,7 +1448,8 @@ ShardCollectionCore(ShardCollectionArgs *args)
 								args->databaseName, args->collectionName)));
 		}
 
-		CreateCollection(databaseDatum, collectionDatum);
+		bool canUseLibPq = false;
+		CreateCollection(databaseDatum, collectionDatum, canUseLibPq);
 		collection = GetMongoCollectionByNameDatum(
 			databaseDatum, collectionDatum, AccessShareLock);
 
@@ -1472,6 +1475,13 @@ ShardCollectionCore(ShardCollectionArgs *args)
 						errdetail_log(
 							"Can not re/unshard collection that is not sharded: %s.%s",
 							args->databaseName, args->collectionName)));
+	}
+
+	if (collection->options.collationString[0] != '\0')
+	{
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg(
+							"Sharding, resharding, or unsharding a collection with a non-simple default collation is not supported")));
 	}
 
 	if (!args->forceRedistribution &&
@@ -1536,8 +1546,7 @@ ShardCollectionCore(ShardCollectionArgs *args)
 	/*
 	 * Planner statistics are intentionally not touched here. The statsEnabled
 	 * collection metadata is left enabled throughout, so this flow performs no
-	 * options update on the collections reference table (which would otherwise
-	 * deadlock against the commutative shard_key update above). The statistics
+	 * options update on the collections reference table. The statistics
 	 * objects on the old data table are dropped when that table is dropped, and
 	 * the index recreation below recreates them on the rebuilt table because the
 	 * collection still has statistics enabled.
@@ -1550,6 +1559,15 @@ ShardCollectionCore(ShardCollectionArgs *args)
 					 "CREATE TABLE %s (LIKE %s INCLUDING ALL EXCLUDING INDEXES EXCLUDING STATISTICS)",
 					 tmpDataTableName, qualifiedDataTableName);
 	ExtensionExecuteQueryViaSPI(queryInfo->data, readOnly, SPI_OK_UTILITY, &isNull);
+
+	/* LIKE does not copy replica identity; restore it before creating the shards. */
+	if (collection->options.changeStreamPreAndPostImagesEnabled)
+	{
+		resetStringInfo(queryInfo);
+		appendStringInfo(queryInfo,
+						 "ALTER TABLE %s REPLICA IDENTITY FULL", tmpDataTableName);
+		ExtensionExecuteQueryViaSPI(queryInfo->data, readOnly, SPI_OK_UTILITY, &isNull);
+	}
 
 	/* change the shard_key_value constraint */
 	resetStringInfo(queryInfo);
@@ -1804,14 +1822,16 @@ ShardCollectionCore(ShardCollectionArgs *args)
 
 		bool buildAsUniqueForPrepareUnique = EnablePrepareUnique;
 		CreateIndexesArg createIndexesArg = ParseCreateIndexesArg(&databaseDatum,
-																  createIndexesMsg,
-																  buildAsUniqueForPrepareUnique);
+																  createIndexesMsg);
 		bool skipCheckCollectionCreate = createIndexesArg.blocking;
 		bool uniqueIndexOnly = false;
 
 		/* We call it good if it doesn't throw. */
+		List *optionalIndexList = NIL;
 		create_indexes_non_concurrently(databaseDatum, createIndexesArg,
-										skipCheckCollectionCreate, uniqueIndexOnly);
+										skipCheckCollectionCreate, uniqueIndexOnly,
+										buildAsUniqueForPrepareUnique,
+										optionalIndexList);
 
 		/* recreate extended indexes */
 		if (EnableExtendedIndexes)

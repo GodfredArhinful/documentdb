@@ -663,6 +663,7 @@ extern Buffer rumStep(Buffer buffer, Relation index, int lockmode,
 extern Buffer rumStepEntryForScans(Buffer buffer, Relation index,
 								   ScanDirection scanDirection);
 extern Buffer rumStepForInsert(Buffer buffer, Relation index, int lockmode);
+extern void rumCheckTreePage(Relation index, Buffer buffer);
 extern void freeRumBtreeStack(RumBtreeStack *stack);
 extern void rumInsertValue(Relation index, RumBtree btree, RumBtreeStack *stack,
 						   RumStatsData *buildStats);
@@ -1189,8 +1190,8 @@ extern PGDLLIMPORT bool RumDisableFastScan;
 extern PGDLLIMPORT bool RumEnableParallelIndexBuild;
 extern PGDLLIMPORT bool RumEnableSkipIntermediateEntry;
 extern PGDLLIMPORT bool RumPruneEmptyPages;
-extern PGDLLIMPORT bool RumTrackIncompleteSplit;
 extern PGDLLIMPORT bool RumFixIncompleteSplit;
+extern PGDLLIMPORT bool RumEnableClearInvalidIncompleteSplit;
 extern PGDLLIMPORT bool RumEnableNewBulkDelete;
 extern PGDLLIMPORT bool RumNewBulkDeleteInlineDataPages;
 extern PGDLLIMPORT bool RumVacuumSkipPrunePostingTreePages;

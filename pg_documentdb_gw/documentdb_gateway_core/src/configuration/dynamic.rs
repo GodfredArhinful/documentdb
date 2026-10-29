@@ -12,7 +12,9 @@ use bson::RawBson;
 
 use crate::{
     configuration::{
-        Version, SOCKET_CONNECTION_IDLE_TIMEOUT_DEFAULT_SECS, SOCKET_CONNECTION_IDLE_TIMEOUT_KEY,
+        Version, CONNECTION_GRACEFUL_CLOSURE_INTERVAL_DEFAULT_SECS,
+        CONNECTION_GRACEFUL_CLOSURE_INTERVAL_SEC_KEY, ENABLE_GRACEFUL_CLOSURE_ON_CERT_ROTATION_KEY,
+        SOCKET_CONNECTION_IDLE_TIMEOUT_DEFAULT_SECS, SOCKET_CONNECTION_IDLE_TIMEOUT_KEY,
     },
     postgres::conn_mgmt,
 };
@@ -114,6 +116,30 @@ pub trait DynamicConfiguration: Send + Sync + Debug {
         self.get_bool("enableConnectionStatus", true)
     }
 
+    fn enable_bson_type_argument_validation(&self) -> bool {
+        self.get_bool("enable_bson_type_argument_validation", true)
+    }
+
+    fn enable_read_concern_validation(&self) -> bool {
+        self.get_bool("enable_read_concern_validation", true)
+    }
+
+    fn enable_session_argument_validation(&self) -> bool {
+        self.get_bool("enable_session_argument_validation", true)
+    }
+
+    fn enable_getmore_argument_validation(&self) -> bool {
+        self.get_bool("enable_getmore_argument_validation", true)
+    }
+
+    fn enable_server_status_command(&self) -> bool {
+        self.get_bool("enable_server_status_command", true)
+    }
+
+    fn enable_role_crud(&self) -> bool {
+        self.get_bool("enableRoleCrud", false)
+    }
+
     fn enable_verbose_logging_in_gateway(&self) -> bool {
         self.get_bool("enableVerboseLoggingInGateway", false)
     }
@@ -159,6 +185,22 @@ pub trait DynamicConfiguration: Send + Sync + Debug {
         self.get_u64(
             SOCKET_CONNECTION_IDLE_TIMEOUT_KEY,
             SOCKET_CONNECTION_IDLE_TIMEOUT_DEFAULT_SECS,
+        )
+    }
+
+    /// Whether an established connection should be closed gracefully once the
+    /// server certificate has been rotated on disk. Defaults to `false`.
+    fn enable_graceful_closure_on_cert_rotation(&self) -> bool {
+        self.get_bool(ENABLE_GRACEFUL_CLOSURE_ON_CERT_ROTATION_KEY, false)
+    }
+
+    /// Minimum interval, in seconds, between certificate rotation checks on a
+    /// single connection. Defaults to
+    /// `CONNECTION_GRACEFUL_CLOSURE_INTERVAL_DEFAULT_SECS`.
+    fn connection_graceful_closure_interval_sec(&self) -> u64 {
+        self.get_u64(
+            CONNECTION_GRACEFUL_CLOSURE_INTERVAL_SEC_KEY,
+            CONNECTION_GRACEFUL_CLOSURE_INTERVAL_DEFAULT_SECS,
         )
     }
 
@@ -233,10 +275,6 @@ pub trait DynamicConfiguration: Send + Sync + Debug {
 
     fn tailable_cursor_await_time_slice_interval_ms(&self) -> i32 {
         self.get_i32("tailableCursorAwaitTimeSliceIntervalMs", 100)
-    }
-
-    fn enable_tailable_cursor_max_await_time(&self) -> bool {
-        self.get_bool("enableTailableCursorMaxAwaitTime", true)
     }
 
     /// Returns the parsed `ClusterVersion` of the deployed `documentdb` extension

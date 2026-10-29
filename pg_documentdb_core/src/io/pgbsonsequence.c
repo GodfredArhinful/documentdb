@@ -1,5 +1,7 @@
 /*-------------------------------------------------------------------------
- * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
  *
  * src/io/bsonsequence_io.c
  *
@@ -14,8 +16,10 @@
 
 #include <postgres.h>
 #include <fmgr.h>
+#include <miscadmin.h>
 #include <utils/builtins.h>
 #include <utils/tuplestore.h>
+#include <utils/memutils.h>
 #include <lib/stringinfo.h>
 
 #define PRIVATE_PGBSON_H
@@ -260,6 +264,95 @@ PgbsonSequenceGetDocumentBsonValues(const pgbsonsequence * bsonSequence)
 
 
 /*
+ * Copies a slice of document values into a sequence without an intermediate
+ * writer buffer. The count is the number of documents, not an end offset.
+ */
+pgbson_require_alignment() pgbsonsequence *
+PgbsonSequenceBuildFromBsonValuesList(List * bsonValuesList, int offset, int count)
+{
+	if (offset < 0 || count < 0 || offset > list_length(bsonValuesList) ||
+		count > list_length(bsonValuesList) - offset)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+						errmsg("Invalid document slice for BSON sequence")));
+	}
+
+	Size sequenceDataSize = 0;
+	for (int i = 0; i < count; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		const bson_value_t *valuePointer = list_nth(bsonValuesList, offset + i);
+
+		if (valuePointer == NULL || valuePointer->value_type != BSON_TYPE_DOCUMENT)
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("BSON sequence requires nonnull document values")));
+		}
+
+		bson_t docsrc;
+		if (!bson_init_static(&docsrc, valuePointer->value.v_doc.data,
+							  valuePointer->value.v_doc.data_len))
+		{
+			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INTERNALERROR),
+							errmsg("Failed to initialize static bson document")));
+		}
+
+		sequenceDataSize += valuePointer->value.v_doc.data_len;
+		if (!AllocSizeIsValid(VARHDRSZ + sequenceDataSize))
+		{
+			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+							errmsg("BSON sequence exceeds the maximum allocation size")));
+		}
+	}
+
+	Size sequenceSize = VARHDRSZ + sequenceDataSize;
+	pgbsonsequence *sequence = palloc(sequenceSize);
+	SET_VARSIZE(sequence, sequenceSize);
+	uint8_t *sequenceData = (uint8_t *) VARDATA(sequence);
+	for (int i = 0; i < count; i++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		const bson_value_t *valuePointer = list_nth(bsonValuesList, offset + i);
+		memcpy(sequenceData, valuePointer->value.v_doc.data,
+			   valuePointer->value.v_doc.data_len);
+		sequenceData += valuePointer->value.v_doc.data_len;
+	}
+
+	return sequence;
+}
+
+
+/*
+ * Checks whether the bsonsequence holds exactly one document. Reading stops as
+ * soon as the answer is known, so large sequences are not walked in full.
+ */
+pgbson_require_alignment() bool
+PgbsonSequenceHasSingleDocument(const pgbsonsequence *bsonSequence)
+{
+	const uint8_t *data = (const uint8_t *) VARDATA_ANY(bsonSequence);
+	uint32_t dataSize = VARSIZE_ANY_EXHDR(bsonSequence);
+
+	bson_reader_t *reader = bson_reader_new_from_data(data, dataSize);
+
+	int documentCount = 0;
+	while (documentCount < 2)
+	{
+		bool reachedEOF = false;
+		const bson_t *document = bson_reader_read(reader, &reachedEOF);
+		if (document == NULL || reachedEOF)
+		{
+			break;
+		}
+
+		documentCount++;
+	}
+
+	bson_reader_destroy(reader);
+	return documentCount == 1;
+}
+
+
+/*
  * Checks whether the string representation of the bson sequence
  * is hex encoded or not.
  */
@@ -353,15 +446,14 @@ PgbsonSequenceInitFromJson(const char *jsonString)
 							BsonTypeName(element.bsonValue.value_type))));
 	}
 
+	/*
+	 * Copy each document directly into the sequence instead of using
+	 * bson_writer_t: bson_writer_begin zeroes one byte past the buffer when
+	 * the previous document ends exactly 5 bytes before the buffer end, which
+	 * corrupts the adjacent allocation.
+	 */
 	bson_iter_t arrayIterator;
-
-	bson_writer_t *writer;
-	uint8_t *buf = NULL;
-	size_t buflen = 0;
-	bson_t *doc;
-	bson_t currentbson;
-
-	writer = bson_writer_new(&buf, &buflen, 0, bson_realloc_ctx, NULL);
+	uint32_t sequenceDataSize = 0;
 
 	BsonValueInitIterator(&element.bsonValue, &arrayIterator);
 	while (bson_iter_next(&arrayIterator))
@@ -374,12 +466,7 @@ PgbsonSequenceInitFromJson(const char *jsonString)
 								   BsonTypeName(currentValue->value_type))));
 		}
 
-		if (!bson_writer_begin(writer, &doc))
-		{
-			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg("Could not initialize bson writer for sequence")));
-		}
-
+		bson_t currentbson;
 		if (!bson_init_static(&currentbson,
 							  currentValue->value.v_doc.data,
 							  currentValue->value.v_doc.data_len))
@@ -389,24 +476,22 @@ PgbsonSequenceInitFromJson(const char *jsonString)
 								"Failed to initialize bson object from provided value")));
 		}
 
-		if (!bson_concat(doc, &currentbson))
-		{
-			ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
-							errmsg(
-								"Could not write value into bson writer for sequence")));
-		}
-
-		bson_writer_end(writer);
+		sequenceDataSize += currentValue->value.v_doc.data_len;
 	}
 
-	buflen = bson_writer_get_length(writer);
-	bson_writer_destroy(writer);
-
-	uint32_t sequenceSize = VARHDRSZ + buflen;
+	uint32_t sequenceSize = VARHDRSZ + sequenceDataSize;
 	pgbsonsequence *sequence = palloc(sequenceSize);
 	SET_VARSIZE(sequence, sequenceSize);
-	memcpy(VARDATA(sequence), buf, buflen);
 
-	bson_free(buf);
+	uint8_t *sequenceData = (uint8_t *) VARDATA(sequence);
+	BsonValueInitIterator(&element.bsonValue, &arrayIterator);
+	while (bson_iter_next(&arrayIterator))
+	{
+		const bson_value_t *currentValue = bson_iter_value(&arrayIterator);
+		memcpy(sequenceData, currentValue->value.v_doc.data,
+			   currentValue->value.v_doc.data_len);
+		sequenceData += currentValue->value.v_doc.data_len;
+	}
+
 	return sequence;
 }

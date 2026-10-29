@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * SPDX-License-Identifier: MIT
  *
  * src/metadata/collection.c
  *
@@ -40,11 +41,13 @@
 #include "utils/guc_utils.h"
 #include "metadata/metadata_guc.h"
 #include "api_hooks.h"
+#include "rbac_hooks.h"
 #include "commands/parse_error.h"
 #include "utils/feature_counter.h"
 #include "jsonschema/bson_json_schema_tree.h"
 
 #define CREATE_COLLECTION_FUNC_NARGS 2
+#define CREATE_COLLECTION_WITH_OPTIONS_FUNC_NARGS 3
 
 
 /*
@@ -122,6 +125,9 @@ PG_FUNCTION_INFO_V1(validate_collection_cache_entry);
 PG_FUNCTION_INFO_V1(validate_try_copy_collection_by_id);
 
 /* forward declarations */
+static bool CreateCollectionWithOptionsInternal(Datum dbNameDatum,
+												Datum collectionNameDatum,
+												bool canUseLibPq, pgbson *options);
 static void InitializeCollectionsHash(void);
 static bool GetMongoCollectionFromCatalogById(uint64 collectionId, Oid relationId,
 											  MongoCollection *collection);
@@ -1598,7 +1604,8 @@ validate_collection_cache_entry(PG_FUNCTION_ARGS)
  * pointer whose content stays valid and equal after the cache is invalidated and
  * rebuilt - with copyByRefFields=false they are left NULL, and a missing collection
  * id returns false. The caller passes a collection with a by-ref field set (e.g. a
- * shard key) so these cases are observable.
+ * shard key) so these cases are observable. When a third argument is supplied, it
+ * also validates canonical collation metadata across copy modes and cache rebuilds.
  */
 Datum
 validate_try_copy_collection_by_id(PG_FUNCTION_ARGS)
@@ -1614,6 +1621,12 @@ validate_try_copy_collection_by_id(PG_FUNCTION_ARGS)
 	if (expected == NULL)
 	{
 		ereport(ERROR, (errmsg("collection does not exist")));
+	}
+
+	const char *expectedCollationString = expected->options.collationString;
+	if (PG_NARGS() == 3)
+	{
+		expectedCollationString = TextDatumGetCString(PG_GETARG_DATUM(2));
 	}
 
 	/* Case 1: copyByRefFields = true gives the caller an independently owned deep
@@ -1680,7 +1693,9 @@ validate_try_copy_collection_by_id(PG_FUNCTION_ARGS)
 						 shallowCopy.relationId == expected->relationId &&
 						 shallowCopy.shardKey == NULL &&
 						 shallowCopy.viewDefinition == NULL &&
-						 shallowCopy.schemaValidator.validator == NULL;
+						 shallowCopy.schemaValidator.validator == NULL &&
+						 strcmp(shallowCopy.options.collationString,
+								expectedCollationString) == 0;
 
 	/* Case 3: a non-existent collection id reports false. */
 	MongoCollection missingCopy;
@@ -1808,7 +1823,44 @@ GetCollectionOrViewCore(PG_FUNCTION_ARGS, bool allowViews)
  * transaction may have created it).
  */
 bool
-CreateCollection(Datum dbNameDatum, Datum collectionNameDatum)
+CreateCollection(Datum dbNameDatum, Datum collectionNameDatum, bool canUseLibPq)
+{
+	pgbson *options = NULL;
+	return CreateCollectionWithOptionsInternal(dbNameDatum, collectionNameDatum,
+											   canUseLibPq, options);
+}
+
+
+/*
+ * Require the options-aware SQL schema and keep local creation in the caller's
+ * transaction. Return whether a new collection was created.
+ */
+bool
+CreateCollectionWithOptions(Datum dbNameDatum, Datum collectionNameDatum, pgbson *options)
+{
+	if (!IsClusterVersionAtleast(DocDB_V1, 3, 0))
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+						errmsg("Collection collation is not supported yet")));
+	}
+
+	/*
+	 * A separate connection would commit creation independently.
+	 * Use the caller's transaction so an error rolls back the collection too.
+	 */
+	bool canUseLibPq = false;
+	return CreateCollectionWithOptionsInternal(dbNameDatum, collectionNameDatum,
+											   canUseLibPq, options);
+}
+
+
+/*
+ * Dispatch legacy or options-aware creation through privilege checks.
+ * Preserve optional libpq dispatch for legacy creation and return its result.
+ */
+static bool
+CreateCollectionWithOptionsInternal(Datum dbNameDatum, Datum collectionNameDatum,
+									bool canUseLibPq, pgbson *options)
 {
 	char *collectionNameStr = TextDatumGetCString(collectionNameDatum);
 	if (collectionNameStr != NULL && strlen(collectionNameStr) == 0)
@@ -1817,29 +1869,37 @@ CreateCollection(Datum dbNameDatum, Datum collectionNameDatum)
 						errmsg("An invalid and empty namespace has been specified")));
 	}
 
-	const char *cmdStr = FormatSqlQuery("SELECT %s.create_collection($1, $2)",
-										ApiSchemaName);
-
-	Oid argTypes[CREATE_COLLECTION_FUNC_NARGS] = { TEXTOID, TEXTOID };
-	Datum argValues[CREATE_COLLECTION_FUNC_NARGS] = {
+	Oid argTypes[CREATE_COLLECTION_WITH_OPTIONS_FUNC_NARGS] = {
+		TEXTOID, TEXTOID, InvalidOid
+	};
+	Datum argValues[CREATE_COLLECTION_WITH_OPTIONS_FUNC_NARGS] = {
 		dbNameDatum,
 		collectionNameDatum,
+		(Datum) 0
 	};
+	int nargs = CREATE_COLLECTION_FUNC_NARGS;
+	const char *schemaName = ApiSchemaName;
+	const char *functionName = "create_collection";
+
+	if (options != NULL)
+	{
+		nargs = CREATE_COLLECTION_WITH_OPTIONS_FUNC_NARGS;
+		functionName = "create_collection_with_options";
+		argValues[2] = PointerGetDatum(options);
+		argTypes[2] = BsonTypeId();
+	}
 
 	/* all args are non-null */
 	char *argNulls = NULL;
 
 	bool isNull = true;
 	bool readOnly = false;
-	Datum resultDatum = ExtensionExecuteQueryWithArgsViaSPI(cmdStr,
-															CREATE_COLLECTION_FUNC_NARGS,
-															argTypes, argValues, argNulls,
-															readOnly, SPI_OK_SELECT,
-															&isNull);
+	Datum resultDatum = RunCollectionLevelFunctionWithPrivilegeChecks(
+		schemaName, functionName, argValues, argTypes, argNulls,
+		nargs, readOnly, canUseLibPq, &isNull);
 	if (isNull)
 	{
-		ereport(ERROR, (errmsg("create_collection unexpectedly "
-							   "returned NULL datum")));
+		ereport(ERROR, (errmsg("%s unexpectedly returned NULL datum", functionName)));
 	}
 
 	return DatumGetBool(resultDatum);
@@ -2567,7 +2627,6 @@ static void
 UpdateCollectionOptions(MongoCollection *collection, const pgbson *updateSpec)
 {
 	bool isNull = false;
-	bool readOnly = false;
 	int numArgs = 2;
 	char isNulls[2] = { ' ', ' ' };
 	Datum datum[2];
@@ -2602,9 +2661,10 @@ UpdateCollectionOptions(MongoCollection *collection, const pgbson *updateSpec)
 					 ApiCatalogSchemaName, CoreSchemaName,
 					 CoreSchemaName, collection->collectionId);
 
-	ExtensionExecuteQueryWithArgsViaSPI(updateOptionQuery->data, numArgs,
-										argOid, datum, isNulls, readOnly,
-										SPI_OK_UPDATE, &isNull);
+	/* A primary-key update of one collection is safe with commutative writes. */
+	RunQueryWithCommutativeWrites(updateOptionQuery->data, numArgs,
+								  argOid, datum, isNulls,
+								  SPI_OK_UPDATE, &isNull);
 }
 
 
@@ -2617,7 +2677,6 @@ static void
 RemoveCollectionOptions(MongoCollection *collection, const pgbson *removeArraySpec)
 {
 	bool isNull = false;
-	bool readOnly = false;
 	int numArgs = 2;
 	char isNulls[2] = { ' ', ' ' };
 	Datum datum[2];
@@ -2652,9 +2711,10 @@ RemoveCollectionOptions(MongoCollection *collection, const pgbson *removeArraySp
 					 ApiCatalogSchemaName, CoreSchemaName,
 					 CoreSchemaName, collection->collectionId);
 
-	ExtensionExecuteQueryWithArgsViaSPI(updateOptionQuery->data, numArgs,
-										argOid, datum, isNulls, readOnly,
-										SPI_OK_UPDATE, &isNull);
+	/* A primary-key update of one collection is safe with commutative writes. */
+	RunQueryWithCommutativeWrites(updateOptionQuery->data, numArgs,
+								  argOid, datum, isNulls,
+								  SPI_OK_UPDATE, &isNull);
 }
 
 
@@ -2699,5 +2759,80 @@ CopyCollectionOptions(const pgbson *options, MongoCollection *collection)
 			collection->options.statsEnabled =
 				BsonValueAsBool(bson_iter_value(&optionsIter));
 		}
+		else if (strcmp(key, "collation") == 0)
+		{
+			const bson_value_t *collationValue = bson_iter_value(&optionsIter);
+
+			ParseAndGetCollationString(collationValue,
+									   collection->options.collationString);
+		}
 	}
+}
+
+
+bson_value_t *
+FetchAndCloneCollationSpecForCollection(const MongoCollection *collection)
+{
+	if (collection == NULL)
+	{
+		ereport(ERROR, (errmsg("Collection must not be NULL")));
+	}
+
+	if (collection->options.collationString[0] == '\0')
+	{
+		return NULL;
+	}
+
+	if (!IsClusterVersionAtleast(DocDB_V1, 0, 0))
+	{
+		return NULL;
+	}
+
+	StringInfoData query;
+	Oid argTypes[1];
+	Datum argValues[1];
+
+	initStringInfo(&query);
+	appendStringInfo(&query,
+					 "SELECT options FROM %s.collections WHERE collection_id = $1",
+					 ApiCatalogSchemaName);
+
+	argTypes[0] = INT8OID;
+	argValues[0] = UInt64GetDatum(collection->collectionId);
+
+	bool isNull = false;
+	int nArgs = 1;
+	char *argNulls = NULL;
+
+	/* Allow dirty reads here to ensure we can create a collection and read it in the same transaction */
+	bool readOnly = false;
+	Datum result = ExtensionExecuteQueryWithArgsViaSPI(query.data, nArgs, argTypes,
+													   argValues, argNulls, readOnly,
+													   SPI_OK_SELECT, &isNull);
+
+	if (isNull)
+	{
+		return NULL;
+	}
+
+	pgbson *options = DatumGetPgBson(result);
+	if (options == NULL)
+	{
+		return NULL;
+	}
+
+	bson_iter_t optionsIter;
+	PgbsonInitIterator(options, &optionsIter);
+	if (!bson_iter_find(&optionsIter, "collation"))
+	{
+		return NULL;
+	}
+
+	const bson_value_t *collationValue = bson_iter_value(&optionsIter);
+	bson_value_t *target = palloc(sizeof(bson_value_t));
+	bson_value_copy(collationValue, target);
+	pfree(options);
+	pfree(query.data);
+
+	return target;
 }

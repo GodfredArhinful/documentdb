@@ -10,7 +10,6 @@ use std::{backtrace::Backtrace, fmt::Display, io};
 
 use bson::raw::ValueAccessError;
 use deadpool_postgres::{BuildError, CreatePoolError, PoolError};
-use documentdb_macros::{documentdb_error_code_enum, documentdb_extensive_log_postgres_errors};
 use openssl::error::ErrorStack;
 use tokio_postgres::error::SqlState;
 
@@ -22,8 +21,11 @@ use crate::{
     },
 };
 
-documentdb_error_code_enum!();
-documentdb_extensive_log_postgres_errors!();
+include!(concat!(env!("OUT_DIR"), "/error_code_enum.rs"));
+include!(concat!(
+    env!("OUT_DIR"),
+    "/postgres_error_logging_mapping.rs"
+));
 
 impl ErrorCode {
     /// Returns the HTTP status code for this error code.
@@ -280,6 +282,17 @@ impl DocumentDBError {
         )
     }
 
+    /// A wire message that is larger than the protocol allows, in either
+    /// direction. The message carries no request content, so it is safe to
+    /// return to the client rather than hiding it behind an internal error.
+    #[must_use]
+    pub fn message_size_exceeded() -> Self {
+        Self::documentdb_error(
+            ErrorCode::InvalidLength,
+            crate::protocol::MESSAGE_SIZE_EXCEEDED_ERROR.to_owned(),
+        )
+    }
+
     #[must_use]
     pub fn internal_error(error_message_internal: String) -> Self {
         Self::new_documentdb_error(
@@ -506,9 +519,20 @@ fn map_pool_db_error_code(
             ErrorCode::TooManyLogicalSessions,
             "There are too many open connections.".to_owned(),
         ),
-        SqlState::CANNOT_CONNECT_NOW => (
+        SqlState::CANNOT_CONNECT_NOW
+        | SqlState::ADMIN_SHUTDOWN
+        | SqlState::CRASH_SHUTDOWN
+        | SqlState::DATABASE_DROPPED => (
             ErrorCode::ShutdownInProgress,
             "Request terminated due to shutdown on the server.".to_owned(),
+        ),
+        SqlState::CONNECTION_EXCEPTION
+        | SqlState::CONNECTION_DOES_NOT_EXIST
+        | SqlState::CONNECTION_FAILURE
+        | SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION
+        | SqlState::SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION => (
+            ErrorCode::HostUnreachable,
+            "Could not establish a connection to the server.".to_owned(),
         ),
         SqlState::INVALID_PASSWORD => (ErrorCode::InvalidPassword, "Invalid password.".to_owned()),
         _ => match map_connection_level_sqlstate(state) {
@@ -529,8 +553,8 @@ fn map_pool_db_error_code(
 impl From<PoolError> for DocumentDBError {
     fn from(error: PoolError) -> Self {
         // Backend errors carrying a recognized SqlState (e.g. connection
-        // exhaustion) are remapped to a more specific ErrorCode; all other
-        // pool errors keep the generic InternalError code.
+        // exhaustion) and pool acquisition timeouts are remapped to more
+        // specific ErrorCodes; all other pool errors keep InternalError.
         match error {
             PoolError::Backend(pg_error)
             | PoolError::PostCreateHook(deadpool_postgres::HookError::Backend(pg_error)) => {
@@ -564,6 +588,16 @@ impl From<PoolError> for DocumentDBError {
                         ErrorKind::Pool,
                     )
                 }
+            }
+            timeout @ PoolError::Timeout(_) => {
+                let internal_message = format!("Pool error: {timeout}");
+                Self::new_documentdb_error(
+                    ErrorCode::ExceededTimeLimit,
+                    "Timed out while acquiring a database connection.".to_owned(),
+                    Some(internal_message),
+                    Some(Box::new(timeout)),
+                    ErrorKind::Pool,
+                )
             }
             other => Self::new_documentdb_error(
                 ErrorCode::InternalError,
@@ -674,10 +708,10 @@ mod tests {
 
     use super::*;
 
-    /// Every `PoolError` variant that does not carry a backend `tokio_postgres`
-    /// error takes the "other" branch, which must produce a PII-safe generic
-    /// user message, a diagnostic internal message, and preserve the original
-    /// `PoolError` as the source so retry logic can downcast via `as_pool_error`.
+    /// Non-backend `PoolError` variants other than timeouts take the "other"
+    /// branch, which must produce a PII-safe generic user message, a diagnostic
+    /// internal message, and preserve the original `PoolError` as the source so
+    /// retry logic can downcast via `as_pool_error`.
     fn assert_other_branch(pool_error: PoolError) {
         let expected_internal = format!("Pool error: {pool_error}");
         let error = DocumentDBError::from(pool_error);
@@ -685,6 +719,28 @@ mod tests {
         assert_eq!(error.error_code(), ErrorCode::InternalError);
         assert_eq!(*error.kind(), ErrorKind::Pool);
         assert_eq!(error.error_message_user(), generic_internal_error_message());
+        assert_eq!(
+            error.error_message_internal(),
+            Some(expected_internal.as_str())
+        );
+        assert!(
+            error.as_pool_error().is_some(),
+            "source should downcast back to PoolError"
+        );
+    }
+
+    /// Pool acquisition timeouts must surface as `ExceededTimeLimit` while
+    /// preserving the diagnostic and source used by retry classification.
+    fn assert_timeout_branch(pool_error: PoolError) {
+        let expected_internal = format!("Pool error: {pool_error}");
+        let error = DocumentDBError::from(pool_error);
+
+        assert_eq!(error.error_code(), ErrorCode::ExceededTimeLimit);
+        assert_eq!(*error.kind(), ErrorKind::Pool);
+        assert_eq!(
+            error.error_message_user(),
+            "Timed out while acquiring a database connection."
+        );
         assert_eq!(
             error.error_message_internal(),
             Some(expected_internal.as_str())
@@ -706,13 +762,18 @@ mod tests {
     }
 
     #[test]
-    fn from_pool_error_wait_timeout_uses_other_branch() {
-        assert_other_branch(PoolError::Timeout(TimeoutType::Wait));
+    fn from_pool_error_wait_timeout_maps_to_exceeded_time_limit() {
+        assert_timeout_branch(PoolError::Timeout(TimeoutType::Wait));
     }
 
     #[test]
-    fn from_pool_error_create_timeout_uses_other_branch() {
-        assert_other_branch(PoolError::Timeout(TimeoutType::Create));
+    fn from_pool_error_create_timeout_maps_to_exceeded_time_limit() {
+        assert_timeout_branch(PoolError::Timeout(TimeoutType::Create));
+    }
+
+    #[test]
+    fn from_pool_error_recycle_timeout_maps_to_exceeded_time_limit() {
+        assert_timeout_branch(PoolError::Timeout(TimeoutType::Recycle));
     }
 
     /// A recognized connection-exhaustion `SqlState` is remapped to
@@ -758,6 +819,46 @@ mod tests {
                 &SqlState::CANNOT_CONNECT_NOW,
                 ErrorCode::ShutdownInProgress,
                 "Request terminated due to shutdown on the server.",
+            ),
+            (
+                &SqlState::ADMIN_SHUTDOWN,
+                ErrorCode::ShutdownInProgress,
+                "Request terminated due to shutdown on the server.",
+            ),
+            (
+                &SqlState::CRASH_SHUTDOWN,
+                ErrorCode::ShutdownInProgress,
+                "Request terminated due to shutdown on the server.",
+            ),
+            (
+                &SqlState::DATABASE_DROPPED,
+                ErrorCode::ShutdownInProgress,
+                "Request terminated due to shutdown on the server.",
+            ),
+            (
+                &SqlState::CONNECTION_EXCEPTION,
+                ErrorCode::HostUnreachable,
+                "Could not establish a connection to the server.",
+            ),
+            (
+                &SqlState::CONNECTION_DOES_NOT_EXIST,
+                ErrorCode::HostUnreachable,
+                "Could not establish a connection to the server.",
+            ),
+            (
+                &SqlState::CONNECTION_FAILURE,
+                ErrorCode::HostUnreachable,
+                "Could not establish a connection to the server.",
+            ),
+            (
+                &SqlState::SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION,
+                ErrorCode::HostUnreachable,
+                "Could not establish a connection to the server.",
+            ),
+            (
+                &SqlState::SQLSERVER_REJECTED_ESTABLISHMENT_OF_SQLCONNECTION,
+                ErrorCode::HostUnreachable,
+                "Could not establish a connection to the server.",
             ),
             (
                 &SqlState::INVALID_PASSWORD,

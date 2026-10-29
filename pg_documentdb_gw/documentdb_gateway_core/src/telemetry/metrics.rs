@@ -24,11 +24,30 @@ use crate::{
 // Gateway Metrics
 // ============================================================================
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AuthenticationOutcome {
+    /// Successful authentication identified by the backend role OID.
+    Success {
+        user_oid: u32,
+    },
+    Failure,
+}
+
+impl AuthenticationOutcome {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success { .. } => "success",
+            Self::Failure => "failure",
+        }
+    }
+}
+
 /// Registers metadata for the gateway's provider-neutral metric instruments.
 ///
 /// Call this after installing the process-wide [`metrics::Recorder`] so each
 /// exporter can receive the shared instrument kinds, units, and descriptions.
 pub fn describe_metrics() {
+    describe_authentication_metrics();
     metrics::describe_histogram!(
         metric_names::OPERATION_DURATION,
         metrics::Unit::Seconds,
@@ -119,6 +138,18 @@ pub fn describe_metrics() {
         metrics::Unit::Count,
         "Logical cursors ended by exhaustion, explicit kill, invalidation, or expiration"
     );
+    describe_startup_metrics();
+}
+
+fn describe_authentication_metrics() {
+    metrics::describe_counter!(
+        metric_names::AUTHENTICATION_ATTEMPTS,
+        metrics::Unit::Count,
+        "Terminal gateway authentication attempts"
+    );
+}
+
+fn describe_startup_metrics() {
     metrics::describe_histogram!(
         metric_names::GATEWAY_STARTUP_DELAY_MS,
         metrics::Unit::Milliseconds,
@@ -129,6 +160,18 @@ pub fn describe_metrics() {
         metrics::Unit::Count,
         "Count of gateway readiness events"
     );
+}
+
+/// Records a terminal authentication attempt using bounded mechanism and
+/// outcome labels. Callers must normalize unregistered mechanisms before
+/// invoking this function.
+pub fn record_authentication_attempt(mechanism: &str, outcome: AuthenticationOutcome) {
+    metrics::counter!(
+        metric_names::AUTHENTICATION_ATTEMPTS,
+        labels::AUTHENTICATION_MECHANISM => mechanism.to_owned(),
+        labels::AUTHENTICATION_OUTCOME => outcome.as_str(),
+    )
+    .increment(1);
 }
 
 /// Records request-level metrics directly in the request handling path.
@@ -288,6 +331,17 @@ pub fn record_startup_metrics(duration: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authentication_outcome_labels_do_not_include_user_oid() {
+        for user_oid in [1, 4242, u32::MAX] {
+            assert_eq!(
+                AuthenticationOutcome::Success { user_oid }.as_str(),
+                "success"
+            );
+        }
+        assert_eq!(AuthenticationOutcome::Failure.as_str(), "failure");
+    }
 
     #[test]
     fn test_record_startup_metrics_callable_without_provider() {

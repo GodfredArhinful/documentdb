@@ -18,6 +18,57 @@ SELECT documentdb_api.create_user('{"createUser":"newBlock2_user", "pwd":"test_p
 
 RESET documentdb.blockedRolePrefixList;
 
+-- Passwords that fail SASLprep must not create or change native users.
+
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_emoji", "pwd":"Valid\ud83e\uddeaPass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+\echo :SQLSTATE
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_private_use", "pwd":"Valid\ue000Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_bidi", "pwd":"Valid\u05d0Pass123!", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.create_user('{"createUser":"saslprep_rejected_empty", "pwd":"\u00ad", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+
+-- Raw BSON reaches password validation without the JSON decoder rejecting UTF-8.
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"createUser":"saslprep_rejected_utf8", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}') AS command
+)
+SELECT documentdb_api.create_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+\echo :SQLSTATE
+
+SELECT count(*) AS rejected_users_created
+FROM pg_authid
+WHERE rolname LIKE 'saslprep_rejected_%';
+
+SET client_min_messages TO WARNING;
+DROP ROLE IF EXISTS saslprep_rejected_emoji, saslprep_rejected_private_use,
+    saslprep_rejected_bidi, saslprep_rejected_empty, saslprep_rejected_utf8;
+RESET client_min_messages;
+
+SELECT documentdb_api.create_user('{"createUser":"saslprep_update_user", "pwd":"test_password", "roles":[{"role":"readAnyDatabase","db":"admin"}], "$db":"admin"}');
+SELECT rolpassword AS saslprep_original_password
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user' \gset
+
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ud83e\uddeaPass123!", "$db":"admin"}');
+\echo :SQLSTATE
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\ue000Pass123!", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"Valid\u05d0Pass123!", "$db":"admin"}');
+SELECT documentdb_api.update_user('{"updateUser":"saslprep_update_user", "pwd":"\u00ad", "$db":"admin"}');
+
+WITH input AS (
+    SELECT documentdb_core.bson_to_bytea('{"updateUser":"saslprep_update_user", "pwd":"test_password", "$db":"admin"}') AS command
+)
+SELECT documentdb_api.update_user(documentdb_core.bson_from_bytea(
+    set_byte(command, position(convert_to('test_password', 'UTF8') IN command) - 1, 255)))
+FROM input;
+\echo :SQLSTATE
+
+SELECT rolpassword = :'saslprep_original_password' AS password_unchanged
+FROM pg_authid
+WHERE rolname = 'saslprep_update_user';
+SELECT pg_has_role('saslprep_update_user', 'documentdb_readonly_role', 'MEMBER') AS membership_unchanged;
+SELECT documentdb_api.drop_user('{"dropUser":"saslprep_update_user", "$db":"admin"}');
+
 --Enable DB admin requirement feature flag
 SET documentdb.enableUsersAdminDBCheck TO ON;
 
@@ -375,6 +426,27 @@ SELECT documentdb_api.create_user('{"createUser":"gatingUserRwRo", "pwd":"test_p
 -- Case 3: the accepted clusterAdmin + readWriteAnyDatabase combination still succeeds.
 SELECT documentdb_api.create_user('{"createUser":"gatingUserAdmin", "pwd":"test_password", "roles":[{"role":"clusterAdmin","db":"admin"},{"role":"readWriteAnyDatabase","db":"admin"}], "$db":"admin"}');
 
+-- Add the standalone read-write backing membership so both it and the admin
+-- backing role expand to readWriteAnyDatabase.
+GRANT documentdb_rbac_readwrite_anydb_role TO "gatingUserAdmin";
+SELECT (LENGTH(gating_admin_info) -
+        LENGTH(REPLACE(gating_admin_info, '"role" : "readWriteAnyDatabase"', ''))) /
+       LENGTH('"role" : "readWriteAnyDatabase"')
+    AS read_write_any_database_role_count
+FROM (SELECT documentdb_core.bson_to_json_string(
+        documentdb_api.users_info('{"usersInfo":"gatingUserAdmin", "$db":"admin"}'))::text
+        AS gating_admin_info) gating_admin;
+
+SET ROLE "gatingUserAdmin";
+SELECT (LENGTH(gating_admin_conn) -
+        LENGTH(REPLACE(gating_admin_conn, '"role" : "readWriteAnyDatabase"', ''))) /
+       LENGTH('"role" : "readWriteAnyDatabase"')
+    AS connection_status_read_write_any_database_role_count
+FROM (SELECT documentdb_core.bson_to_json_string(
+        documentdb_api.connection_status('{"connectionStatus":1, "$db":"admin"}'))::text
+        AS gating_admin_conn) gating_admin_conn_row;
+RESET ROLE;
+
 -- Case 4: readWriteAnyDatabase on its own remains unavailable while the
 -- enforcement feature is disabled.
 SET documentdb.enable_readwrite_any_database_role_enforcement TO OFF;
@@ -416,6 +488,7 @@ SELECT documentdb_api.create_role('{"createRole":"customUserRole", "roles":["rea
 
 -- Granting the custom role to a new user succeeds.
 SELECT documentdb_api.create_user('{"createUser":"customRoleUser", "pwd":"test_password", "roles":[{"role":"customUserRole","db":"admin"}], "$db":"admin"}');
+SELECT documentdb_api.grant_roles_to_user('{"grantRolesToUser":"customRoleUser", "roles":["readAnyDatabase"], "$db":"admin"}');
 
 -- Combining the custom role with a built-in role is rejected: a user resolves
 -- to exactly one role.
@@ -472,10 +545,14 @@ SELECT documentdb_api.users_info(
         '{"usersInfo":"customRoleUser", "$db":"admin"}') AS custom_users_info \gset
 SELECT :'custom_users_info' LIKE '%"role" : "customUserRole"%'
     AS custom_role_reported_by_users_info;
+SELECT :'custom_users_info' LIKE '%"role" : "readAnyDatabase"%'
+    AS built_in_role_reported_by_users_info;
 SELECT documentdb_api.connection_status(
         '{"connectionStatus":1, "$db":"admin"}') AS custom_connection_status \gset
 SELECT :'custom_connection_status' LIKE '%"role" : "customUserRole"%'
     AS custom_role_reported_by_connection_status;
+SELECT :'custom_connection_status' LIKE '%"role" : "readAnyDatabase"%'
+    AS built_in_role_reported_by_connection_status;
 RESET ROLE;
 
 -- Cleanup
@@ -509,6 +586,7 @@ SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_api_a
 SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_baseline_read_role');
 SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_baseline_write_role');
 SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_readwrite_anydb_role');
+SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_rbac_privilege_reader_role');
 
 -- IS_SYSTEM_LOGIN_ROLE: system login roles should be reserved
 SELECT documentdb_test_helpers.test_is_reserved_role_name('documentdb_bg_worker_role');
@@ -529,9 +607,8 @@ DROP FUNCTION documentdb_test_helpers.test_is_reserved_role_name(text);
 -- A role that a user merely created must not be reported as a role the user holds.
 -- PostgreSQL 16 and later records a membership for the role that runs CREATE ROLE
 -- carrying ADMIN OPTION but neither INHERIT nor SET, so it confers none of the new
--- role's privileges. connectionStatus resolves the caller's role by picking the
--- first membership in name order, so such a membership on a name that sorts early
--- would otherwise displace the role the user actually holds.
+-- role's privileges. connectionStatus must filter that membership while preserving
+-- every role the user actually holds.
 SET documentdb.enableRoleCrud TO ON;
 SET documentdb.enableRolesAdminDBCheck TO ON;
 

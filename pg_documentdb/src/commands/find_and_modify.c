@@ -1,5 +1,7 @@
 /*-------------------------------------------------------------------------
  * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
  *
  * src/commands/find_and_modify.c
  *
@@ -16,6 +18,7 @@
 
 #include "io/bson_core.h"
 #include "update/bson_update.h"
+#include "collation/collation.h"
 #include "commands/commands_common.h"
 #include "commands/delete.h"
 #include "commands/insert.h"
@@ -69,6 +72,14 @@ typedef struct
 	/* "bypassDocumentValidation" field */
 	bool bypassDocumentValidation;
 
+	/* command collation */
+	char collationString[MAX_ICU_COLLATION_LENGTH];
+
+	/*
+	 * Whether a non-null, non-empty collation was specified, including "simple".
+	 */
+	bool hasExplicitCollation;
+
 	/* parsed variable spec */
 	bson_value_t variableSpec;
 } FindAndModifySpec;
@@ -114,12 +125,6 @@ typedef struct
 } FindAndModifyResult;
 
 
-/* findAndModify specific not-implemented options */
-const char *const NotImplementedOptions[] = {
-	"hint"
-};
-
-
 PG_FUNCTION_INFO_V1(command_find_and_modify);
 
 
@@ -133,6 +138,7 @@ static pgbson * BuildResponseMessage(FindAndModifyResult *result);
 extern bool SkipFailOnCollation;
 extern bool EnableBypassDocumentValidation;
 extern bool EnableSchemaValidation;
+extern bool EnableBsonTypeArgumentValidation;
 
 
 Query *
@@ -211,7 +217,7 @@ command_find_and_modify(PG_FUNCTION_ARGS)
 			{
 				const bson_value_t *variableSpec = NULL;
 				ValidateUpdateDocument(spec.update, spec.query, spec.arrayFilters,
-									   variableSpec);
+									   variableSpec, spec.collationString);
 			}
 
 			FindAndModifyResult result = {
@@ -266,7 +272,9 @@ ParseFindAndModifyMessage(pgbson *message, Datum *databaseNameDatum)
 		{
 			if (!BSON_ITER_HOLDS_UTF8(&messageIter))
 			{
-				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
+				ereport(ERROR, (errcode(EnableBsonTypeArgumentValidation ?
+										ERRCODE_DOCUMENTDB_INVALIDNAMESPACE :
+										ERRCODE_DOCUMENTDB_BADVALUE),
 								errmsg("Collection name contains an invalid data type %s",
 									   BsonIterTypeName(&messageIter))));
 			}
@@ -364,7 +372,18 @@ ParseFindAndModifyMessage(pgbson *message, Datum *databaseNameDatum)
 		{
 			ReportFeatureUsage(FEATURE_COLLATION);
 
-			if (!SkipFailOnCollation)
+			if (EnableCollation &&
+				IsClusterVersionAtleast(DocDB_V1, 1, 0))
+			{
+				if (EnsureTopLevelFieldIsDocumentNullOrEmptyOk(
+						"findAndModify.collation", &messageIter))
+				{
+					ParseAndGetCollationString(bson_iter_value(&messageIter),
+											   spec.collationString);
+					spec.hasExplicitCollation = true;
+				}
+			}
+			else if (!SkipFailOnCollation)
 			{
 				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
 								errmsg(
@@ -389,10 +408,43 @@ ParseFindAndModifyMessage(pgbson *message, Datum *databaseNameDatum)
 		else if (strcmp(key, "let") == 0)
 		{
 			ReportFeatureUsage(FEATURE_LET_TOP_LEVEL);
-			EnsureTopLevelFieldType("findAndModify.let", &messageIter,
-									BSON_TYPE_DOCUMENT);
+			if (EnableBsonTypeArgumentValidation)
+			{
+				if (EnsureTopLevelFieldTypeNullOk("findAndModify.let", &messageIter,
+												  BSON_TYPE_DOCUMENT))
+				{
+					let = *bson_iter_value(&messageIter);
+				}
+			}
+			else
+			{
+				EnsureTopLevelFieldType("findAndModify.let", &messageIter,
+										BSON_TYPE_DOCUMENT);
+				let = *bson_iter_value(&messageIter);
+			}
+		}
+		else if (strcmp(key, "hint") == 0)
+		{
+			if (!EnableBsonTypeArgumentValidation)
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
+								errmsg("findAndModify.hint is not implemented yet")));
+			}
+			if (!BSON_ITER_HOLDS_DOCUMENT(&messageIter) &&
+				!BSON_ITER_HOLDS_UTF8(&messageIter))
+			{
+				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_FAILEDTOPARSE),
+								errmsg(
+									"The BSON field 'findAndModify.hint' has an incorrect "
+									"type '%s'; it should be one of the following valid "
+									"types: [object, string]",
+									BsonIterTypeName(&messageIter))));
+			}
 
-			let = *bson_iter_value(&messageIter);
+			/*
+			 * hint is validated for type compatibility but not currently
+			 * applied, consistent with update and delete handling.
+			 */
 		}
 		else if (strcmp(key, "$db") == 0)
 		{
@@ -422,18 +474,6 @@ ParseFindAndModifyMessage(pgbson *message, Datum *databaseNameDatum)
 			ereport(DEBUG1, (errmsg("findAndModify.%s is not implemented yet", key)));
 
 			continue;
-		}
-
-		/* XXX: But we don't silently ignore the following */
-		for (long unsigned int i = 0; i < lengthof(NotImplementedOptions); i++)
-		{
-			const char *notImplementedOption = NotImplementedOptions[i];
-			if (strcmp(key, notImplementedOption) == 0)
-			{
-				ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_COMMANDNOTSUPPORTED),
-								errmsg("findAndModify.%s is not implemented yet",
-									   notImplementedOption)));
-			}
 		}
 
 		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_BADVALUE),
@@ -510,6 +550,12 @@ static FindAndModifyResult
 ProcessFindAndModifySpec(MongoCollection *collection, FindAndModifySpec *spec,
 						 text *transactionId)
 {
+	if (!spec->hasExplicitCollation)
+	{
+		strlcpy(spec->collationString, collection->options.collationString,
+				sizeof(spec->collationString));
+	}
+
 	int64 shardKeyHash = 0;
 	bool shardKeyValueCollationAware = false;
 	bool hasShardKeyValueFilter =
@@ -519,6 +565,15 @@ ProcessFindAndModifySpec(MongoCollection *collection, FindAndModifySpec *spec,
 										 spec->query,
 										 &shardKeyHash,
 										 &shardKeyValueCollationAware);
+
+	if (IsCollationApplicable(spec->collationString) &&
+		shardKeyValueCollationAware)
+	{
+		ereport(ERROR, (errcode(ERRCODE_DOCUMENTDB_INVALIDOPTIONS),
+						errmsg("findAndModify on a sharded collection cannot "
+							   "be routed to a single shard when the shard key "
+							   "value is collation-sensitive (string type).")));
+	}
 
 	if (!hasShardKeyValueFilter)
 	{
@@ -534,8 +589,12 @@ ProcessFindAndModifySpec(MongoCollection *collection, FindAndModifySpec *spec,
 			.returnFields = spec->returnFields,
 			.returnDeletedDocument = true,
 			.sort = spec->sort,
-			.variableSpec = &spec->variableSpec
+			.variableSpec = &spec->variableSpec,
+			.hasExplicitCollation = spec->hasExplicitCollation
 		};
+
+		strlcpy((char *) deleteOneParams.collationString, spec->collationString,
+				sizeof(deleteOneParams.collationString));
 
 		DeleteOneResult deleteOneResult = { 0 };
 		bool forceInlineWrites = false;
@@ -575,8 +634,12 @@ ProcessFindAndModifySpec(MongoCollection *collection, FindAndModifySpec *spec,
 			.returnFields = spec->returnFields,
 			.sort = spec->sort,
 			.update = spec->update,
-			.variableSpec = &spec->variableSpec
+			.variableSpec = &spec->variableSpec,
+			.hasExplicitCollation = spec->hasExplicitCollation
 		};
+
+		strlcpy(updateOneParams.collationString, spec->collationString,
+				sizeof(updateOneParams.collationString));
 
 		UpdateOneResult updateOneResult = { 0 };
 		bool forceInlineWrites = false;
@@ -585,7 +648,8 @@ ProcessFindAndModifySpec(MongoCollection *collection, FindAndModifySpec *spec,
 		if (CheckSchemaValidationEnabled(collection, spec->bypassDocumentValidation))
 		{
 			evalState = PrepareForSchemaValidation(collection->schemaValidator.validator,
-												   CurrentMemoryContext);
+												   CurrentMemoryContext,
+												   collection->options.collationString);
 		}
 
 		ExecuteUpdateOne(collection, &updateOneParams, shardKeyHash, transactionId,

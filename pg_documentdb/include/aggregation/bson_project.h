@@ -136,12 +136,16 @@ typedef struct ProjectDocumentState
 typedef BsonExpressionState BsonReplaceRootRedactState;
 
 
+void FreeProjectionStateTree(BsonProjectionQueryState *state);
+
 const BsonProjectionQueryState * GetProjectionStateForBsonProject(
 	bson_iter_t *projectionSpecIter, bool forceProjectId,
 	bool
 	allowInclusionExclusion,
 	const pgbson *
-	variableSpec);
+	variableSpec,
+	const char *
+	collationString);
 
 const BsonProjectionQueryState * GetProjectionStateForBsonProjectFind(
 	bson_iter_t *projectionSpecIter, bool forceProjectId,
@@ -154,7 +158,9 @@ const BsonProjectionQueryState * GetProjectionStateForBsonProjectFind(
 	collationString);
 
 const BsonProjectionQueryState * GetProjectionStateForBsonAddFields(
-	bson_iter_t *projectionSpecIter, const bson_value_t *variableSpec);
+	bson_iter_t *projectionSpecIter, const bson_value_t *variableSpec,
+	const char *
+	collationString);
 const BsonProjectionQueryState * GetProjectionStateForBsonUnset(const bson_value_t *
 																unsetValue,
 																bool forceProjectId);

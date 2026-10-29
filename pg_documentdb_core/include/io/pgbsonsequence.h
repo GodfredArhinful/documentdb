@@ -1,5 +1,7 @@
 /*-------------------------------------------------------------------------
- * Copyright (c) Microsoft Corporation.  All rights reserved.
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT License.
+ * SPDX-License-Identifier: MIT
  *
  * include/io/pgbsonsequence.h
  *
@@ -25,5 +27,8 @@ typedef struct
 	((pgbsonsequence *) PG_DETOAST_DATUM(PG_GETARG_DATUM(n)))
 
 List * PgbsonSequenceGetDocumentBsonValues(const pgbsonsequence *bsonSequence);
+bool PgbsonSequenceHasSingleDocument(const pgbsonsequence *bsonSequence);
+pgbsonsequence * PgbsonSequenceBuildFromBsonValuesList(List *bsonValuesList, int offset,
+													   int count);
 
 #endif
